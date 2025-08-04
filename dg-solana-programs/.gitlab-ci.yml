@@ -1,0 +1,3 @@
+variables:
+  SERVICE_NAME: "dg-solana-programs"
+  SERVICE_VERSION: "1.0.0"

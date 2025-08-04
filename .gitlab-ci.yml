@@ -1,0 +1,34 @@
+default:
+  tags:
+    - dind
+
+stages:
+  - build
+  - deploy
+
+build:
+  image: registry.degate.space/degate/devops-environment:0.0.7-ci
+  stage: build
+  rules:
+    - if: '$EXCLUDE_BUILD != "true" && $SERVICES != ""'
+  script:
+    - ./cicd/build.sh "${SERVICES}"
+
+deploy:
+  image: registry.degate.space/degate/devops-environment:0.0.7
+  stage: deploy
+  rules:
+    - if: '$EXCLUDE_DEPLOY != "true" && $SERVICES != "" && $CI_COMMIT_BRANCH != "staging" && $CI_COMMIT_BRANCH != "production"'
+  script:
+    - ./cicd/deploy.sh "${SERVICES}" "${ENV}"
+
+workflow:
+  rules:
+    - if: '$SERVICES'
+    - if: >
+        ($CI_COMMIT_BRANCH == "dev" ||
+        $CI_COMMIT_BRANCH == "testd" ||
+        $CI_COMMIT_BRANCH == "teste" ||
+        $CI_COMMIT_BRANCH == "testf" ||
+        $CI_COMMIT_BRANCH == "staging" ||
+        $CI_COMMIT_BRANCH == "production")

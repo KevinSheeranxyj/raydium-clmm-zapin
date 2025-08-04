@@ -1,0 +1,37 @@
+{
+  "isInit": true,
+  "workloadResource": "deployment",
+  "replicas": 1,
+  "serviceClusterIP": "None",
+  "deploymentStrategy": {
+    "type": "RollingUpdate",
+    "rollingUpdate": {
+      "maxSurge": "25%",
+      "maxUnavailable": "25%"
+    }
+  },
+  "dev": {
+    "namespace": "dev-backend",
+    "consulPrefix": "DEV"
+  },
+  "testd": {
+    "namespace": "testd-be",
+    "consulPrefix": "testd"
+  },
+  "teste": {
+    "namespace": "teste-be",
+    "consulPrefix": "teste"
+  },
+  "testf": {
+    "namespace": "testf-be",
+    "consulPrefix": "testf"
+  },
+  "staging": {
+    "namespace": "backend-be",
+    "consulPrefix": "STG"
+  },
+  "production": {
+    "namespace": "backend-be",
+    "consulPrefix": "PRD"
+  }
+}
