@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<module type="JAVA_MODULE" version="4">
+  <component name="NewModuleRootManager" inherit-compiler-output="true">
+    <exclude-output />
+    <content url="file://$MODULE_DIR$">
+      <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/programs/dg-solana-programs/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/programs/general/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/src/lib/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/tests" isTestSource="true" />
+      <excludeFolder url="file://$MODULE_DIR$/dg-solana-programs/src/lib/target" />
+      <excludeFolder url="file://$MODULE_DIR$/dg-solana-programs/target" />
+    </content>
+    <orderEntry type="inheritedJdk" />
+    <orderEntry type="sourceFolder" forTests="false" />
+  </component>
+</module>
