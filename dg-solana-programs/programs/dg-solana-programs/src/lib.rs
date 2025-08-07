@@ -75,7 +75,23 @@ pub mod dg_solana_programs {
             transfer_data.recipient
         );
         Ok(())
+    }
 
+    // Modify PDA Authority
+    pub fn modify_pda_authority(ctx: Context<ModifyPdaAuthority>, new_authority: Pubkey) -> Result<()> {
+        let transfer_data = &mut ctx.accounts.transfer_data;
+
+        // Verify current authority
+        require!(transfer_data.initialized, TransferError::NotInitialized);
+        require!(
+            transfer_data.authority == ctx.accounts.current_authority.key(),
+            TransferError::Unauthorized
+        );
+
+        // Update authority
+        transfer_data.authority = new_authority;
+        msg!("Update PDA Authority to: {}", new_authority);
+        Ok(())
     }
 }
 
@@ -124,6 +140,19 @@ pub struct Execute<'info> {
     pub recipient_token_account: Account<'info, TokenAccount>,
     pub token_program: Program<'info, Token>,
 
+}
+#[derive(Accounts)]
+pub struct ModifyPdaAuthority<'info> {
+    #[account(
+        mut,
+        seeds = [b"transefr_data"],
+        bump
+    )]
+    pub transfer_data: Account<'info, TransferData>,
+    #[account(
+        constraint = current_authority.key() == transfer_data.authority @ TransferError::Unauthorized
+    )]
+    pub current_authority: Signer<'info>,
 }
 
 #[account]
