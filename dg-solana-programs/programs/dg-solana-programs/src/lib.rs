@@ -1,7 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{self, Token, TokenAccount, Transfer};
 
-declare_id!("DxzbvkdnQhXGmEz732meAeF9TS8qLit7SAcpa6JXnB6P");
+declare_id!("j3q33yPf3b74tKkXepzcK5oZ45ULgCUpAjtxXWfUF1z");
 
 #[program]
 pub mod dg_solana_programs {
