@@ -47,6 +47,17 @@ pub mod dg_solana_programs {
         transfer_data.recipient = recipient;
         transfer_data.executed = false;
 
+        let cpi_accounts = Transfer {
+            from: ctx.accounts.authority_ata.to_account_info(),
+            to: ctx.accounts.treasury_ata.to_account_info(),
+            authority: ctx.accounts.authority.to_account_info(),
+        };
+        token::transfer(
+            CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts),
+            amount,
+        )?;
+
+
         msg!(
              "Deposited transfer details: ID={}, Amount={}, Recipient={}",
             transfer_data.transfer_id,
@@ -147,7 +158,27 @@ pub struct Deposit<'info> {
         constraint = authority.key() == transfer_data.authority @ TransferError::Unauthorized
     )]
     pub authority: Signer<'info>,
+    #[account(
+        mut,
+        constraint = authority_ata.mint == usdc_mint.key() @ TransferError::InvalidMint,
+        constraint = authority_ata.owner == authority.key() @ TransferError::Unauthorized // Changed to check authority ownership
+    )]
+    pub authority_ata: Account<'info, TokenAccount>, // Changed from user_ata to authority_ata
+    #[account(
+        mut,
+        constraint = treasury_ata.mint == usdc_mint.key() @ TransferError::InvalidMint
+    )]
+    pub treasury_ata: Account<'info, TokenAccount>,
+    #[account(
+        constraint = usdc_mint.mint_authority.is_some() @ TransferError::InvalidMint
+    )]
+    pub usdc_mint: Account<'info, Mint>,
+    #[account(
+        constraint = token_program.key() == token::ID @ TransferError::InvalidTokenProgram
+    )]
+    pub token_program: Program<'info, Token>,
 }
+
 
 #[derive(Accounts)]
 pub struct Execute<'info> {
