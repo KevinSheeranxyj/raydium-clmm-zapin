@@ -1,11 +1,14 @@
 use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Token, TokenAccount, Transfer};
+use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
+use anchor_lang::solana_program::pubkey;
 
 declare_id!("j3q33yPf3b74tKkXepzcK5oZ45ULgCUpAjtxXWfUF1z");
 
 #[program]
 pub mod dg_solana_programs {
     use super::*;
+
+    pub const USDC_MINT: Pubkey = pubkey!("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
 
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let transfer_data = &mut ctx.accounts.transfer_data;
@@ -15,6 +18,12 @@ pub mod dg_solana_programs {
         Ok(())
     }
 
+    #[event]
+    pub struct DepositEvent {
+        pub transfer_id: String,
+        pub amount: u64,
+        pub recipient: Pubkey,
+    }
     // Deposit transfer details into PDA
     pub fn deposit(
       ctx: Context<Deposit>,
@@ -30,7 +39,7 @@ pub mod dg_solana_programs {
         require!(!transfer_id.is_empty(), TransferError::InvalidTransferId);
 
         // Store transfer details
-        transfer_data.transfer_id = transfer_id;
+        transfer_data.transfer_id = transfer_id.clone();
         transfer_data.amount = amount;
         transfer_data.recipient = recipient;
         transfer_data.executed = false;
@@ -41,6 +50,11 @@ pub mod dg_solana_programs {
             transfer_data.amount,
             transfer_data.recipient
         );
+        emit!(DepositEvent {
+            transfer_id: transfer_id.clone(),
+            amount,
+            recipient,
+        });
         Ok(())
     }
 
@@ -53,6 +67,12 @@ pub mod dg_solana_programs {
         require!(transfer_data.initialized, TransferError::NotInitialized);
         require!(transfer_data.executed, TransferError::AlreadyExecuted);
         require!(transfer_data.amount > 0, TransferError::InvalidAmount);
+
+        // Enforce recipient matches stored PDA recipient
+        require!(
+            ctx.accounts.recipient_token_account.owner == transfer_data.recipient,
+            TransferError::Unauthorized
+        );
 
         // Prepare SPL token transfer
         let cpi_accounts = Transfer {
@@ -95,6 +115,8 @@ pub mod dg_solana_programs {
     }
 }
 
+
+
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
@@ -131,13 +153,21 @@ pub struct Execute<'info> {
         seeds = [b"transfer_data"],
         bump
     )]
-    pub transfer_data: Account<'info, TransferData>,
+    pub transfer_data: Box<Account<'info, TransferData>>,
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = user_token_account.mint == usdc_mint.key() @ TransferError::InvalidMint,
+        constraint = user_token_account.owner == user.key() @ TransferError::Unauthorized
+    )]
     pub user_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
+    #[account(
+        mut,
+        constraint = recipient_token_account.mint == usdc_mint.key() @ TransferError::InvalidMint
+    )]
     pub recipient_token_account: Account<'info, TokenAccount>,
+    pub usdc_mint: Account<'info, Mint>,
     pub token_program: Program<'info, Token>,
 
 }
@@ -145,7 +175,7 @@ pub struct Execute<'info> {
 pub struct ModifyPdaAuthority<'info> {
     #[account(
         mut,
-        seeds = [b"transefr_data"],
+        seeds = [b"transfer_data"],
         bump
     )]
     pub transfer_data: Account<'info, TransferData>,
@@ -167,7 +197,14 @@ pub struct TransferData {
 }
 
 impl TransferData {
-    pub const LEN: usize = 32 + 1 + 64 + 8 + 32 + 1; // Give a proper size for serialization
+    pub const MAX_TRANSFER_ID_LEN: usize = 32;
+    pub const LEN: usize = 8 + // discriminator
+        32 + // authority (Pubkey)
+        1 +  // initialized (bool)
+        4 + Self::MAX_TRANSFER_ID_LEN + // transfer_id (String)
+        8 +  // amount (u64)
+        32 + // recipient (Pubkey)
+        1; // executed(bool)
 }
 
 
@@ -183,4 +220,6 @@ pub enum TransferError {
     AlreadyExecuted,
     #[msg("Unauthorized access")]
     Unauthorized,
+    #[msg("Invalid mint")]
+    InvalidMint,
 }

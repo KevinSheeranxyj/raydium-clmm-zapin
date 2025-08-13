@@ -1,4 +1,4 @@
-import {createAccount, createMint, getOrCreateAssociatedTokenAccount, mintTo} from "@solana/spl-token";
+import { getOrCreateAssociatedTokenAccount} from "@solana/spl-token";
 import {Keypair, PublicKey} from "@solana/web3.js";
 import * as web3 from "@solana/web3.js";
 import * as anchor from "@coral-xyz/anchor";
@@ -17,7 +17,7 @@ let recipientTokenAccount: PublicKey;
 let transferDataPda: PublicKey;
 let admin : Keypair;
 let recipient: Keypair;
-let authority: Wallet;
+let authority: anchor.Wallet;
 let bump: number;
 
 const transferId = "t1219282211";
@@ -41,12 +41,24 @@ async function prepare() {
 }
 
 
-
+let connection;
 describe("dg-solana-programs", () => {
     before(async () => {
         await prepare();
+
         // https://falling-wiser-moon.solana-mainnet.quiknode.pro/653e836d3a2a94fb452fdc2a3796b420cb809b10
-        let connection = new web3.Connection("https://api.mainnet-beta.solana.com", 'confirmed')
+        // https://warmhearted-delicate-uranium.solana-mainnet.quiknode.pro/300dfad121b027e64f41fc3b31d342d4b38ed5be
+        // https://mainnet.helius-rpc.com/?api-key=76647368-1e0d-405b-b0aa-b5e2d006b58d
+        connection = new web3.Connection("https://warmhearted-delicate-uranium.solana-mainnet.quiknode.pro/300dfad121b027e64f41fc3b31d342d4b38ed5be", 'confirmed')
+        try {
+            console.log("Checking RPC health...");
+            const blockhash = await connection.getLatestBlockhash();
+            console.log("Latest Blockhash:", blockhash);
+        } catch (error) {
+            console.error("RPC health check failed:", error);
+            throw new Error("Cannot connect to RPC endpoint");
+        }
+
         const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(admin), {
             commitment: 'confirmed'
         })
@@ -94,13 +106,16 @@ describe("dg-solana-programs", () => {
 
 
     it("Initializes the PDA", async () => {
-        await program.methods
+        const tx = await program.methods
             .initialize()
             .accounts({
                 transferData: transferDataPda,
                 authority: authority.publicKey,
             })
-            .rpc();
+            .rpc()
+            .catch((e) => {console.log(e)});
+
+        await connection.confirmTransaction(tx, 'confirmed')
 
         const transferData = await program.account.transferData.fetch(transferDataPda);
         console.log("transferData: ", transferData);
