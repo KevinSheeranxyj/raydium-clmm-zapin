@@ -65,7 +65,7 @@ pub mod dg_solana_programs {
 
         // Verify transfer data
         require!(transfer_data.initialized, TransferError::NotInitialized);
-        require!(transfer_data.executed, TransferError::AlreadyExecuted);
+        require!(!transfer_data.executed, TransferError::AlreadyExecuted);
         require!(transfer_data.amount > 0, TransferError::InvalidAmount);
 
         // Enforce recipient matches stored PDA recipient
@@ -167,7 +167,13 @@ pub struct Execute<'info> {
         constraint = recipient_token_account.mint == usdc_mint.key() @ TransferError::InvalidMint
     )]
     pub recipient_token_account: Account<'info, TokenAccount>,
+    #[account(
+        constraint = usdc_mint.mint_authority.is_some() @ TransferError::InvalidMint
+    )]
     pub usdc_mint: Account<'info, Mint>,
+    #[account(
+        constraint = token_program.key() == token::ID @ TransferError::InvalidTokenProgram
+    )]
     pub token_program: Program<'info, Token>,
 
 }
@@ -222,4 +228,6 @@ pub enum TransferError {
     Unauthorized,
     #[msg("Invalid mint")]
     InvalidMint,
+    #[msg("Invalid token program")]
+    InvalidTokenProgram,
 }
