@@ -33,6 +33,9 @@ pub mod dg_solana_programs {
     ) -> Result<()> {
         let transfer_data = &mut ctx.accounts.transfer_data;
 
+        // In case space overflow
+        require!(transfer_id.len() <= TransferData::MAX_TRANSFER_ID_LEN, TransferError::InvalidTransferId);
+
         // Verify transfer params
         require!(transfer_data.initialized, TransferError::NotInitialized);
         require!(amount > 0, TransferError::InvalidAmount);
