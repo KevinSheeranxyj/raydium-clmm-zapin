@@ -2,11 +2,13 @@ use anchor_lang::prelude::*;
 use anchor_lang::solana_program::pubkey;
 use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
 use anchor_spl::token_interface::{Token2022, Mint as InterfaceMint, TokenAccount as InterfaceTokenAccount};
+use anchor_spl::metadata::Metadata;
 use anchor_lang::prelude::Rent;
 use anchor_spl::memo::spl_memo;
 use anchor_lang::prelude::Sysvar;
 use anchor_lang::error::Error;
 use raydium_amm_v3::libraries::{big_num::*, full_math::MulDiv, tick_math};
+use anchor_spl::associated_token::AssociatedToken;
 use std::str::FromStr;
 use raydium_amm_v3::{
     cpi,
@@ -99,27 +101,28 @@ pub mod dg_solana_programs {
 
     // Execute the token transfer
     pub fn execute(ctx: Context<Execute>) -> Result<()> {
-        let od = &mut ctx.accounts.operation_data;
-        require!(od.initialized, OperationError::NotInitialized);
-        require!(!od.executed, OperationError::AlreadyExecuted);
-        require!(od.amount > 0, OperationError::InvalidAmount);
+        let od_ro = &mut ctx.accounts.operation_data;
+        require!(od_ro.initialized, OperationError::NotInitialized);
+        require!(!od_ro.executed, OperationError::AlreadyExecuted);
+        require!(od_ro.amount > 0, OperationError::InvalidAmount);
+
+        let amount = od_ro.amount;
+        let op_type = od_ro.operation_type.clone();
+        let action  = od_ro.action.clone();
 
         let bump = ctx.bumps.operation_data;
-        let signer_seeds: &[&[u8]] = &[
+        let seeds: &[&[u8]] = &[
             b"operation_data",
             &[bump],          // 1-byte slice
         ];
 
-        let cpi_ctx = CpiContext::new_with_signer(
-            cpi_program,
-            cpi_accounts,
-            &[signer_seeds],  // note: &[ ... ] to make `&[&[u8]]`
-        );
+        let signer_seeds: &[&[&[u8]]] = &[seeds];
+        let cpi_program = ctx.accounts.token_program.to_account_info();
 
-        match od.operation_type {
+        match op_type {
             OperationType::Transfer => {
-                let p: TransferParams = deserialize_params(&od.action)?;
-                require!(p.amount == od.amount, OperationError::InvalidParams);
+                let p: TransferParams = deserialize_params(&action)?;
+                require!(p.amount == amount, OperationError::InvalidParams);
                 require!(ctx.accounts.recipient_token_account.owner == p.recipient, OperationError::Unauthorized);
 
                 let cpi_accounts = Transfer {
@@ -130,21 +133,32 @@ pub mod dg_solana_programs {
                 let cpi_program = ctx.accounts.token_program.to_account_info();
                 token::transfer(
                     CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds),
-                    od.amount,
+                    amount,
                 )?;
             }
             OperationType::ZapIn => {
-                let p: ZapInParams = deserialize_params(&od.action)?;
+                let p: ZapInParams = deserialize_params(&action)?;
                 require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
 
-                let pool = ctx.accounts.pool_state.load()?;
+                let (sp, mint0, mint1, vault0, vault1, obs_key) = {
+                    let pool = ctx.accounts.pool_state.load()?; // Ref<PoolState>
+                    (
+                        pool.sqrt_price_x64,
+                        pool.token_mint_0,
+                        pool.token_mint_1,
+                        pool.token_vault_0,
+                        pool.token_vault_1,
+                        pool.observation_key,
+                    )
+                };
+
+                let remaining_accounts = ctx.remaining_accounts.to_vec();
+
                 // 1) get sqrt prices for ticks (u128); map any tick_math error to your OperationError
                 let sa = tick_math::get_sqrt_price_at_tick(p.tick_lower)
                     .map_err(|_| error!(OperationError::InvalidParams))?;
                 let sb = tick_math::get_sqrt_price_at_tick(p.tick_upper)
                     .map_err(|_| error!(OperationError::InvalidParams))?;
-                // current pool price (u128)
-                let sp = pool.sqrt_price_x64;
                 // basic sanity check
                 require!(sa < sb, OperationError::InvalidTickRange);
                 require!(sp >= sa && sp <= sb, OperationError::InvalidParams);
@@ -165,10 +179,9 @@ pub mod dg_solana_programs {
                 let frac_den = r_den + r_num;
                 require!(frac_den > U256::from(0u8), OperationError::InvalidParams);
 
+                let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
 
-                let is_base_input = ctx.accounts.program_token_account.mint == pool.token_0;
-
-                let amount_in_u256 = U256::from(od.amount);
+                let amount_in_u256 = U256::from(amount);
 
                 // swap_amount = amount_in * r_num / frac_den      (base input)
                 // swap_amount = amount_in * r_den / frac_den      (quote input)
@@ -186,26 +199,26 @@ pub mod dg_solana_programs {
                 let pre_in  = get_token_balance(&ctx.accounts.input_token_account)?;
 
                 // 组 CPI 账户（把 input/output_token_account 换成托管的两个）
-                let swap_cpi_accounts = cpi::accounts::SwapSingleV2 {
-                    payer: ctx.accounts.operation_data.to_account_info(),// set operation_data as a payer
-                    amm_config: ctx.accounts.amm_config.to_account_info(),
-                    pool_state: ctx.accounts.pool_state.to_account_info(),
-                    input_token_account: ctx.accounts.input_token_account.to_account_info(),
-                    output_token_account: ctx.accounts.output_token_account.to_account_info(),
-                    input_vault: ctx.accounts.input_vault.to_account_info(),
-                    output_vault: ctx.accounts.output_vault.to_account_info(),
-                    observation_state: ctx.accounts.observation_state.to_account_info(),
-                    token_program: ctx.accounts.token_program.to_account_info(),
-                    token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                    memo_program: ctx.accounts.memo_program.to_account_info(),
-                    input_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                    output_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                };
+                // let swap_cpi_accounts = ;
                 let swap_ctx = CpiContext::new(
                     ctx.accounts.clmm_program.to_account_info(),
-                    swap_cpi_accounts,
+                    cpi::accounts::SwapSingleV2 {
+                        payer: ctx.accounts.operation_data.to_account_info(),// set operation_data as a payer
+                        amm_config: ctx.accounts.amm_config.to_account_info(),
+                        pool_state: ctx.accounts.pool_state.to_account_info(),
+                        input_token_account: ctx.accounts.input_token_account.to_account_info(),
+                        output_token_account: ctx.accounts.output_token_account.to_account_info(),
+                        input_vault: ctx.accounts.input_vault.to_account_info(),
+                        output_vault: ctx.accounts.output_vault.to_account_info(),
+                        observation_state: ctx.accounts.observation_state.to_account_info(),
+                        token_program: ctx.accounts.token_program.to_account_info(),
+                        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+                        memo_program: ctx.accounts.memo_program.to_account_info(),
+                        input_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
+                        output_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
+                    },
                 ).with_signer(signer_seeds)
-                    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+                    .with_remaining_accounts(remaining_accounts.clone());
 
                 let other_amount_threshold = if is_base_input {
                     p.min_amount_out // min out
@@ -225,7 +238,7 @@ pub mod dg_solana_programs {
                 let post_in  = get_token_balance(&ctx.accounts.input_token_account)?;
                 let received = post_out.checked_sub(pre_out).ok_or(error!(OperationError::InvalidParams))?;
                 let spent    = pre_in.checked_sub(post_in).ok_or(error!(OperationError::InvalidParams))?;
-                let remaining = od.amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
+                let remaining = amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
 
             // 直接默认没有个人头寸：无条件开仓
              let open_ctx = CpiContext::new(
@@ -243,9 +256,19 @@ pub mod dg_solana_programs {
                              token_program: ctx.accounts.token_program.to_account_info(),
                              system_program: ctx.accounts.system_program.to_account_info(),
                              rent: ctx.accounts.rent.to_account_info(),
+                             associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
+                             token_account_0: ctx.accounts.token_account_0.to_account_info(),
+                             token_account_1: ctx.accounts.token_account_1.to_account_info(),
+                             token_vault_0: ctx.accounts.input_vault.to_account_info(),
+                             token_vault_1: ctx.accounts.output_vault.to_account_info(),
+                             vault_0_mint: ctx.accounts.input_vault_mint.to_account_info(),
+                             vault_1_mint: ctx.accounts.output_vault_mint.to_account_info(),
+                             metadata_program: ctx.accounts.metadata_program.to_account_info(),
+                             metadata_account: ctx.accounts.metadata_account.to_account_info(),
+                             token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
                         }
                 ).with_signer(signer_seeds)
-                .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+                .with_remaining_accounts(remaining_accounts.clone());
 
 
                 let  tick_lower_index:i32 = 1;
@@ -296,7 +319,7 @@ pub mod dg_solana_programs {
                         vault_1_mint: ctx.accounts.output_vault_mint.to_account_info(),
                     }
                 ).with_signer(signer_seeds)
-                    .with_remaining_accounts(ctx.remaining_accounts.to_vec());
+                    .with_remaining_accounts(remaining_accounts.clone());
 
                 cpi::increase_liquidity_v2(
                     inc_ctx,
@@ -312,7 +335,10 @@ pub mod dg_solana_programs {
             }
         }
 
-        od.executed = true;
+        {
+            let od_rw = &mut ctx.accounts.operation_data;
+            od_rw.executed = true;
+        }
         Ok(())
     }
     // Modify PDA Authority
@@ -337,7 +363,7 @@ pub mod dg_solana_programs {
 }
 
 
-fn get_token_balance<T: AccountDeserialize>(acc: &InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
+fn get_token_balance(acc: &InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
     Ok(acc.amount)
 }
 // Helper function to deserialize params
@@ -414,9 +440,9 @@ pub struct Execute<'info> {
     pub user: Signer<'info>,
 
     // switch to interface types for InterfaceAccount
-    #[account(address = pool_state.load()?.token_0)]
+    #[account(mut, constraint = input_token_account.mint == input_vault_mint.key())]
     pub input_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(address = pool_state.load()?.token_1)]
+    #[account(mut, constraint = output_token_account.mint == output_vault_mint.key())]
     pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]
@@ -430,18 +456,18 @@ pub struct Execute<'info> {
     pub pool_state: AccountLoader<'info, PoolState>,
 
     // pool vaults should be interface accounts too
-    #[account(mut)]
+    #[account(mut, address = pool_state.load()?.token_vault_0)]
     pub input_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut)]
+    #[account(mut, address = pool_state.load()?.token_vault_1)]
     pub output_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(mut, address = pool_state.load()?.observation_key)]
     pub observation_state: AccountLoader<'info, ObservationState>,
 
     // these constraints now reference interface mints
-    #[account(address = pool_state.load()?.token_0)]
+    #[account(address = pool_state.load()?.token_mint_0)]
     pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = pool_state.load()?.token_1)]
+    #[account(address = pool_state.load()?.token_mint_1)]
     pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
 
     #[account(address = spl_memo::id())]
@@ -475,6 +501,39 @@ pub struct Execute<'info> {
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
     #[account(mut)]
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
+
+    #[account(
+        mut,
+        token::mint = token_vault_0.mint
+    )]
+    pub token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(
+        mut,
+        token::mint = token_vault_1.mint
+    )]
+    pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    #[account(mut)]
+    pub metadata_account: UncheckedAccount<'info>,
+
+    pub metadata_program: Program<'info, Metadata>,
+
+    #[account(
+        mut,
+        constraint = token_vault_0.key() == pool_state.load()?.token_vault_0
+    )]
+    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    /// The address that holds pool tokens for token_1
+    #[account(
+        mut,
+        constraint = token_vault_1.key() == pool_state.load()?.token_vault_1
+    )]
+    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+
+    /// Associated Token Program
+    pub associated_token_program: Program<'info, AssociatedToken>,
 
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
@@ -519,6 +578,12 @@ pub enum OperationType {
     Transfer,
     ZapIn,
     ZapOut,
+}
+
+impl Default for OperationType {
+    fn default() -> Self {
+        OperationType::Transfer
+    }
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
