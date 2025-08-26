@@ -330,8 +330,171 @@ pub mod dg_solana_programs {
                 )?;
             }
             OperationType::ZapOut => {
-                // TODO:
-                return err!(OperationError::InvalidParams);
+                let p: ZapOutParams = deserialize_params(&action)?;
+
+                // Basic auth and routing checks
+                require!(ctx.accounts.recipient_token_account.owner == p.recipient, OperationError::Unauthorized);
+
+                // Ensure the working token accounts are controlled by our PDA, since the PDA will sign.
+                require!(ctx.accounts.input_token_account.owner == ctx.accounts.operation_data.key(), OperationError::Unauthorized);
+                require!(ctx.accounts.output_token_account.owner == ctx.accounts.operation_data.key(), OperationError::Unauthorized);
+
+                // What mint do we want to end up with?
+                let want_mint = if p.want_base {
+                    ctx.accounts.input_vault_mint.key()
+                } else {
+                    ctx.accounts.output_vault_mint.key()
+                };
+                require!(ctx.accounts.recipient_token_account.mint == want_mint, OperationError::InvalidMint);
+
+                let remaining_accounts = ctx.remaining_accounts.to_vec();
+                let pre0 = get_token_balance(&ctx.accounts.input_token_account)?;
+                let pre1 = get_token_balance(&ctx.accounts.output_token_account)?;
+
+                // Figure out how much liquidity to burn.
+                // Burn all if not specified (or zero).
+                let full_liquidity: u128 = {
+                    // PersonalPositionState has a `liquidity` field (u128 in Raydium v3).
+                    ctx.accounts.personal_position.liquidity
+                };
+                require!(full_liquidity > 0, OperationError::InvalidParams);
+
+                let burn_liquidity_u128: u128 = if p.liquidity_to_burn_u64 > 0 {
+                    p.liquidity_to_burn_u64 as u128
+                } else {
+                    full_liquidity
+                };
+                require!(burn_liquidity_u128 <= full_liquidity, OperationError::InvalidParams);
+
+                // 1) Decrease liquidity → proceeds go to PDA-owned token accounts (input/output_token_account)
+                let dec_ctx = CpiContext::new(
+                    ctx.accounts.clmm_program.to_account_info(),
+                    cpi::accounts::DecreaseLiquidityV2 {
+                        nft_owner: ctx.accounts.user.to_account_info(),
+                        nft_account: ctx.accounts.position_nft_account.to_account_info(),
+                        pool_state: ctx.accounts.pool_state.to_account_info(),
+                        protocol_position: ctx.accounts.protocol_position.to_account_info(),
+                        personal_position: ctx.accounts.personal_position.to_account_info(),
+                        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
+                        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
+                        recipient_token_account_0: ctx.accounts.recipient_token_account_0.to_account_info(),
+                        recipient_token_account_1: ctx.accounts.recipient_token_account_1.to_account_info(),
+                        token_vault_0: ctx.accounts.input_vault.to_account_info(),
+                        token_vault_1: ctx.accounts.output_vault.to_account_info(),
+                        token_program: ctx.accounts.token_program.to_account_info(),
+                        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+                        vault_0_mint: ctx.accounts.input_vault_mint.to_account_info(),
+                        vault_1_mint: ctx.accounts.output_vault_mint.to_account_info(),
+                        memo_program: ctx.accounts.memo_program.to_account_info(),
+                    }
+                ).with_signer(signer_seeds)
+                    .with_remaining_accounts(remaining_accounts.clone());
+
+                // For strict slippage on removal, replace the 0/0 mins below with params.
+                // Raydium signature matches increase_liquidity_v2 style: (liquidity, amount_0_min, amount_1_min, base_flag)
+                cpi::decrease_liquidity_v2(
+                    dec_ctx,
+                    burn_liquidity_u128,
+                    0, // amount_0_min
+                    0, // amount_1_min
+                )?;
+
+                // Balances after burn
+                let post0 = get_token_balance(&ctx.accounts.input_token_account)?;
+                let post1 = get_token_balance(&ctx.accounts.output_token_account)?;
+                let got0 = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
+                let got1 = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
+
+                // 2) If we ended with some of the "other" side, swap it into the desired side
+                //    so we can pay out in a single mint.
+                let (mut total_out, mut swap_amount, is_base_input, swap_ctx) = if p.want_base {
+                    // desire mint_0 → swap any mint_1 into mint_0
+                    let swap_ctx = CpiContext::new(
+                        ctx.accounts.clmm_program.to_account_info(),
+                        cpi::accounts::SwapSingleV2 {
+                            payer: ctx.accounts.operation_data.to_account_info(),
+                            amm_config: ctx.accounts.amm_config.to_account_info(),
+                            pool_state: ctx.accounts.pool_state.to_account_info(),
+                            input_token_account: ctx.accounts.output_token_account.to_account_info(),  // giving quote
+                            output_token_account: ctx.accounts.input_token_account.to_account_info(),  // receiving base
+                            input_vault: ctx.accounts.output_vault.to_account_info(),
+                            output_vault: ctx.accounts.input_vault.to_account_info(),
+                            observation_state: ctx.accounts.observation_state.to_account_info(),
+                            token_program: ctx.accounts.token_program.to_account_info(),
+                            token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+                            memo_program: ctx.accounts.memo_program.to_account_info(),
+                            input_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
+                            output_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
+                        },
+                    ).with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
+                    (got0, got1, false, swap_ctx)
+                } else {
+                    // desire mint_1 → swap any mint_0 into mint_1
+                    let swap_ctx = CpiContext::new(
+                        ctx.accounts.clmm_program.to_account_info(),
+                        cpi::accounts::SwapSingleV2 {
+                            payer: ctx.accounts.operation_data.to_account_info(),
+                            amm_config: ctx.accounts.amm_config.to_account_info(),
+                            pool_state: ctx.accounts.pool_state.to_account_info(),
+                            input_token_account: ctx.accounts.input_token_account.to_account_info(),   // giving base
+                            output_token_account: ctx.accounts.output_token_account.to_account_info(), // receiving quote
+                            input_vault: ctx.accounts.input_vault.to_account_info(),
+                            output_vault: ctx.accounts.output_vault.to_account_info(),
+                            observation_state: ctx.accounts.observation_state.to_account_info(),
+                            token_program: ctx.accounts.token_program.to_account_info(),
+                            token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
+                            memo_program: ctx.accounts.memo_program.to_account_info(),
+                            input_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
+                            output_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
+                        },
+                    ).with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
+                    (got1, got0, true, swap_ctx)
+                };
+
+                if swap_amount > 0 {
+                    cpi::swap_v2(
+                        swap_ctx,
+                        swap_amount,
+                        p.other_amount_threshold,
+                        p.sqrt_price_limit_x64,
+                        is_base_input,
+                    )?;
+
+                    // refresh total_out after swap
+                    if p.want_base {
+                        let new_base = get_token_balance(&ctx.accounts.input_token_account)?;
+                        total_out = new_base.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
+                    } else {
+                        let new_quote = get_token_balance(&ctx.accounts.output_token_account)?;
+                        total_out = new_quote.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
+                    }
+                }
+
+                // 3) Enforce payout floors (both the op.amount you stored and the param-level min)
+                require!(total_out >= p.min_payout, OperationError::InvalidParams);
+                require!(total_out >= amount, OperationError::InvalidParams); // `amount` from OperationData (acts as a floor)
+
+                // 4) Send to recipient (single-sided)
+                let from_ai = if p.want_base {
+                    ctx.accounts.input_token_account.to_account_info()
+                } else {
+                    ctx.accounts.output_token_account.to_account_info()
+                };
+
+                let cpi_accounts = Transfer {
+                    from: from_ai,
+                    to: ctx.accounts.recipient_token_account.to_account_info(),
+                    authority: ctx.accounts.operation_data.to_account_info(),
+                };
+                token::transfer(
+                    CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds),
+                    total_out,
+                )?;
+
+                // Optionally: if all liquidity burned, you could close the position NFT here via Raydium's close instruction.
+                // (Left out to keep this minimal and because it requires extra accounts; add if needed.)
             }
         }
 
@@ -431,10 +594,10 @@ pub struct Execute<'info> {
     )]
     pub operation_data: Box<Account<'info, OperationData>>,
     #[account(mut)]
-    pub program_token_account: Account<'info, TokenAccount>,
+    pub program_token_account: Box<Account<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]
-    pub recipient_token_account: Account<'info, TokenAccount>, // concrete, fine
+    pub recipient_token_account: Box<Account<'info, InterfaceTokenAccount>>, // concrete, fine
 
     #[account(mut)]
     pub user: Signer<'info>,
@@ -477,6 +640,20 @@ pub struct Execute<'info> {
         constraint = clmm_program.key() == RAYDIUM_CLMM_PROGRAM_ID
     )]
     pub clmm_program: Program<'info, AmmV3>,
+
+    /// The destination token account for receive amount_0
+    #[account(
+        mut,
+        token::mint = token_vault_0.mint
+    )]
+    pub recipient_token_account_0: Box<InterfaceAccount<'info, TokenAccount>>,
+
+    /// The destination token account for receive amount_1
+    #[account(
+        mut,
+        token::mint = token_vault_1.mint
+    )]
+    pub recipient_token_account_1: Box<InterfaceAccount<'info, TokenAccount>>,
 
     #[account(
         mut,
@@ -534,6 +711,7 @@ pub struct Execute<'info> {
 
     /// Associated Token Program
     pub associated_token_program: Program<'info, AssociatedToken>,
+
 
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
@@ -604,6 +782,23 @@ pub struct ZapInParams {
     pub tick_upper: i32,      // Upper tick for liquidity range
     pub sqrt_price_limit_x64: u128,
     pub other_amount_threshold: u64,
+}
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ZapOutParams {
+    /// If true, end with base token(mint_0), If false, end with quote token(mint_1)
+    pub want_base: bool,
+    /// Mint total tokens you ultimately send to recipient(same mint as the desired side).
+    pub min_payout: u64,
+    /// Swap constraints (only used if we need to convert the “other” side).
+    pub sqrt_price_limit_x64: u128,
+    pub other_amount_threshold: u64,
+    /// Who should receive the final token (checked against the provided ATA’s owner).
+    pub recipient: Pubkey,
+    /// If provided and > 0, burn exactly this liquidity. Otherwise burn all current liquidity.
+    /// (Raydium liquidity is u128; we accept u64 here and cast—good enough for many cases.
+    /// If you need full-precision control, switch to u128.)
+    pub liquidity_to_burn_u64: u64,
+
 }
 
 
