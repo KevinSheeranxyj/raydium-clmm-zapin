@@ -18,8 +18,7 @@ use raydium_amm_v3::{
 
 declare_id!("2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A");
 
-/// NOTE: For zapIn, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
-
+/// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
 #[program]
 pub mod dg_solana_programs {
     use super::*;
@@ -179,7 +178,6 @@ pub mod dg_solana_programs {
                 let pre_out = get_token_balance(&ctx.accounts.output_token_account)?;
                 let pre_in  = get_token_balance(&ctx.accounts.input_token_account)?;
 
-                let remaining_accounts = ctx.remaining_accounts.to_vec();
                 {
                     let clmm          = ctx.accounts.clmm_program.to_account_info();
                     let payer         = ctx.accounts.operation_data.to_account_info();
@@ -219,8 +217,7 @@ pub mod dg_solana_programs {
                     };
 
                     let swap_ctx = CpiContext::new(clmm, swap_accounts)
-                        .with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
+                        .with_signer(signer_seeds);
 
                     cpi::swap_v2(
                         swap_ctx,
@@ -229,7 +226,7 @@ pub mod dg_solana_programs {
                         p.sqrt_price_limit_x64,
                         is_base_input,
                     )?;
-                } // <- 结束 Block B，释放 AccountInfo 局部变量
+                }
 
                 // 成交后余额差
                 let post_out = get_token_balance(&ctx.accounts.output_token_account)?;
@@ -238,7 +235,6 @@ pub mod dg_solana_programs {
                 let spent    = pre_in.checked_sub(post_in).ok_or(error!(OperationError::InvalidParams))?;
                 let remaining = amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
 
-                // ---------- Block C: open_position_v2 ----------
                 {
                     let clmm            = ctx.accounts.clmm_program.to_account_info();
                     let payer           = ctx.accounts.operation_data.to_account_info();
@@ -290,8 +286,7 @@ pub mod dg_solana_programs {
                     };
 
                     let open_ctx = CpiContext::new(clmm, open_accounts)
-                        .with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
+                        .with_signer(signer_seeds);
 
                     // TODO: pass real value
                     let tick_array_lower_start_index = 1;
@@ -359,8 +354,7 @@ pub mod dg_solana_programs {
                     };
 
                     let inc_ctx = CpiContext::new(clmm  , inc_accounts)
-                        .with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
+                        .with_signer(signer_seeds);
 
                     cpi::increase_liquidity_v2(
                         inc_ctx,
@@ -387,8 +381,6 @@ pub mod dg_solana_programs {
                     ctx.accounts.output_vault_mint.key()
                 };
                 require!(ctx.accounts.recipient_token_account.mint == want_mint, OperationError::InvalidMint);
-
-                let remaining_accounts = ctx.remaining_accounts.to_vec();
 
                 // 赎回前余额
                 let pre0 = get_token_balance(&ctx.accounts.input_token_account)?;
@@ -461,8 +453,7 @@ pub mod dg_solana_programs {
                     };
 
                     let dec_ctx = CpiContext::new(clmm, dec_accounts)
-                        .with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
+                        .with_signer(signer_seeds);
 
                     cpi::decrease_liquidity_v2(
                         dec_ctx,
@@ -534,8 +525,7 @@ pub mod dg_solana_programs {
                         };
 
                         let swap_ctx = CpiContext::new(clmm, swap_accounts)
-                            .with_signer(signer_seeds)
-                            .with_remaining_accounts(remaining_accounts.clone());
+                            .with_signer(signer_seeds);
 
                         cpi::swap_v2(
                             swap_ctx,
@@ -579,7 +569,6 @@ pub mod dg_solana_programs {
 
                 // 若仓位已空，关闭仓位
                 if ctx.accounts.personal_position.liquidity == 0 {
-                    // 根据你使用的 Raydium SDK 版本，选择 ClosePosition 或 ClosePositionV2
                     let clmm         = ctx.accounts.clmm_program.to_account_info();
                     let payer        = ctx.accounts.operation_data.to_account_info();
                     let pool_state   = ctx.accounts.pool_state.to_account_info();
@@ -594,7 +583,6 @@ pub mod dg_solana_programs {
                     let metadata_prog= ctx.accounts.metadata_program.to_account_info();
                     let metadata     = ctx.accounts.metadata_account.to_account_info();
 
-                    // 这里示例用 V2（你前面 open/inc/dec 都用 V2）
                     let close_accounts = cpi::accounts::ClosePosition {
                         nft_owner: protocol_pos,
                         personal_position: personal_pos,
@@ -605,8 +593,7 @@ pub mod dg_solana_programs {
                     };
 
                     let close_ctx = CpiContext::new(clmm, close_accounts)
-                        .with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
+                        .with_signer(signer_seeds);
 
                     cpi::close_position(close_ctx)?;
                     msg!("Position closed and NFT burned.");
@@ -614,7 +601,6 @@ pub mod dg_solana_programs {
             }
         }
 
-        // 函数末尾再短借用一次写回
         ctx.accounts.operation_data.executed = true;
         Ok(())
     }
@@ -791,7 +777,7 @@ pub struct Execute<'info> {
     pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
     #[account(address = pool_state.load()?.token_mint_1)]
     pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-
+    /// CHECK: memo_program pub key
     #[account(address = spl_memo::id())]
     pub memo_program: UncheckedAccount<'info>,
 
@@ -845,6 +831,7 @@ pub struct Execute<'info> {
     )]
     pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
+    /// CHECK: metadata_account
     #[account(mut)]
     pub metadata_account: UncheckedAccount<'info>,
     pub metadata_program: Program<'info, Metadata>,
