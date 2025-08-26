@@ -24,7 +24,6 @@ declare_id!("2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A");
 pub mod dg_solana_programs {
     use super::*;
 
-
     pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
         pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"); // mainnet program ID
 
@@ -33,18 +32,17 @@ pub mod dg_solana_programs {
         let operation_data = &mut ctx.accounts.operation_data;
         operation_data.authority = ctx.accounts.authority.key();
         operation_data.initialized = true;
-        msg!(
-            "Initialized PDA with authority: {}",
-            operation_data.authority
-        );
+        msg!("Initialized PDA with authority: {}", operation_data.authority);
         Ok(())
     }
+
     #[event]
     pub struct DepositEvent {
         pub transfer_id: String,
         pub amount: u64,
         pub recipient: Pubkey,
     }
+
     // Deposit transfer details into PDA
     pub fn deposit(
         ctx: Context<Deposit>,
@@ -82,10 +80,10 @@ pub mod dg_solana_programs {
             operation_data.recipient = p.recipient;
         }
         if let OperationType::ZapIn = operation_type {
-            let p: ZapInParams = deserialize_params(&operation_data.action)?;
+            let _p: ZapInParams = deserialize_params(&operation_data.action)?;
         }
         if let OperationType::ZapOut = operation_type {
-            let p: ZapOutParams = deserialize_params(&operation_data.action)?;
+            let _p: ZapOutParams = deserialize_params(&operation_data.action)?;
         }
 
         msg!(
@@ -104,23 +102,19 @@ pub mod dg_solana_programs {
 
     // Execute the token transfer
     pub fn execute(ctx: Context<Execute>) -> Result<()> {
-        let od_ro = &mut ctx.accounts.operation_data;
-        require!(od_ro.initialized, OperationError::NotInitialized);
-        require!(!od_ro.executed, OperationError::AlreadyExecuted);
-        require!(od_ro.amount > 0, OperationError::InvalidAmount);
+        require!(ctx.accounts.operation_data.initialized, OperationError::NotInitialized);
+        require!(!ctx.accounts.operation_data.executed, OperationError::AlreadyExecuted);
+        require!(ctx.accounts.operation_data.amount > 0, OperationError::InvalidAmount);
 
-        let amount = od_ro.amount;
-        let op_type = od_ro.operation_type.clone();
-        let action  = od_ro.action.clone();
+        let amount = ctx.accounts.operation_data.amount;
+        let op_type = ctx.accounts.operation_data.operation_type.clone();
+        let action  = ctx.accounts.operation_data.action.clone();
 
         let bump = ctx.bumps.operation_data;
-        let seeds: &[&[u8]] = &[
-            b"operation_data",
-            &[bump],          // 1-byte slice
-        ];
-
+        let seeds: &[&[u8]] = &[b"operation_data", &[bump]];
         let signer_seeds: &[&[&[u8]]] = &[seeds];
-        let cpi_program = ctx.accounts.token_program.to_account_info();
+
+        let token_program = ctx.accounts.token_program.to_account_info();
 
         match op_type {
             OperationType::Transfer => {
@@ -133,36 +127,27 @@ pub mod dg_solana_programs {
                     to: ctx.accounts.recipient_token_account.to_account_info(),
                     authority: ctx.accounts.operation_data.to_account_info(),
                 };
-                let cpi_program = ctx.accounts.token_program.to_account_info();
                 token::transfer(
-                    CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds),
+                    CpiContext::new_with_signer(token_program, cpi_accounts, signer_seeds),
                     amount,
                 )?;
             }
+
             OperationType::ZapIn => {
                 let p: ZapInParams = deserialize_params(&action)?;
                 require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
 
-                let (sp, mint0, mint1, vault0, vault1, obs_key) = {
+                let sp = {
                     let pool = ctx.accounts.pool_state.load()?; // Ref<PoolState>
-                    (
-                        pool.sqrt_price_x64,
-                        pool.token_mint_0,
-                        pool.token_mint_1,
-                        pool.token_vault_0,
-                        pool.token_vault_1,
-                        pool.observation_key,
-                    )
+                    pool.sqrt_price_x64
                 };
 
-                let remaining_accounts = ctx.remaining_accounts.to_vec();
-
-                // 1) get sqrt prices for ticks (u128); map any tick_math error to your OperationError
+                // 1) get sqrt prices for ticks
                 let sa = tick_math::get_sqrt_price_at_tick(p.tick_lower)
                     .map_err(|_| error!(OperationError::InvalidParams))?;
                 let sb = tick_math::get_sqrt_price_at_tick(p.tick_upper)
                     .map_err(|_| error!(OperationError::InvalidParams))?;
-                // basic sanity check
+
                 require!(sa < sb, OperationError::InvalidTickRange);
                 require!(sp >= sa && sp <= sb, OperationError::InvalidParams);
 
@@ -170,12 +155,9 @@ pub mod dg_solana_programs {
                 let sb_u = U256::from(sb);
                 let sp_u = U256::from(sp);
 
-                // (sp - sa) and (sb - sp) with underflow guards
                 let sp_minus_sa = if sp_u >= sa_u { sp_u - sa_u } else { return err!(OperationError::InvalidParams); };
                 let sb_minus_sp = if sb_u >= sp_u { sb_u - sp_u } else { return err!(OperationError::InvalidParams); };
 
-                // r_num = sb * (sp - sa)
-                // r_den = sp * (sb - sp)
                 let r_num = sb_u * sp_minus_sa;
                 let r_den = sp_u * sb_minus_sp;
 
@@ -185,159 +167,216 @@ pub mod dg_solana_programs {
                 let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
 
                 let amount_in_u256 = U256::from(amount);
-
-                // swap_amount = amount_in * r_num / frac_den      (base input)
-                // swap_amount = amount_in * r_den / frac_den      (quote input)
                 let swap_amount_u256 = if is_base_input {
                     amount_in_u256.mul_div_floor(r_num, frac_den).ok_or(error!(OperationError::InvalidParams))?
                 } else {
                     amount_in_u256.mul_div_floor(r_den, frac_den).ok_or(error!(OperationError::InvalidParams))?
                 };
-                // convert safely to u64
                 let swap_amount = swap_amount_u256.to_underflow_u64();
                 require!(swap_amount as u128 <= u64::MAX as u128, OperationError::InvalidParams);
 
-                // 记录前后余额，得到实际成交量
+                // 记录前后余额
                 let pre_out = get_token_balance(&ctx.accounts.output_token_account)?;
                 let pre_in  = get_token_balance(&ctx.accounts.input_token_account)?;
 
-                // 组 CPI 账户（把 input/output_token_account 换成托管的两个）
-                // let swap_cpi_accounts = ;
-                let swap_ctx = CpiContext::new(
-                    ctx.accounts.clmm_program.to_account_info(),
-                    cpi::accounts::SwapSingleV2 {
-                        payer: ctx.accounts.operation_data.to_account_info(),// set operation_data as a payer
-                        amm_config: ctx.accounts.amm_config.to_account_info(),
-                        pool_state: ctx.accounts.pool_state.to_account_info(),
-                        input_token_account: ctx.accounts.input_token_account.to_account_info(),
-                        output_token_account: ctx.accounts.output_token_account.to_account_info(),
-                        input_vault: ctx.accounts.input_vault.to_account_info(),
-                        output_vault: ctx.accounts.output_vault.to_account_info(),
-                        observation_state: ctx.accounts.observation_state.to_account_info(),
-                        token_program: ctx.accounts.token_program.to_account_info(),
-                        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                        memo_program: ctx.accounts.memo_program.to_account_info(),
-                        input_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                        output_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                    },
-                ).with_signer(signer_seeds)
-                    .with_remaining_accounts(remaining_accounts.clone());
+                let remaining_accounts = ctx.remaining_accounts.to_vec();
+                {
+                    let clmm          = ctx.accounts.clmm_program.to_account_info();
+                    let payer         = ctx.accounts.operation_data.to_account_info();
+                    let amm_cfg       = ctx.accounts.amm_config.to_account_info();
+                    let pool_state    = ctx.accounts.pool_state.to_account_info();
+                    let in_acc        = ctx.accounts.input_token_account.to_account_info();
+                    let out_acc       = ctx.accounts.output_token_account.to_account_info();
+                    let in_vault      = ctx.accounts.input_vault.to_account_info();
+                    let out_vault     = ctx.accounts.output_vault.to_account_info();
+                    let obs           = ctx.accounts.observation_state.to_account_info();
+                    let token_prog    = ctx.accounts.token_program.to_account_info();
+                    let token2022     = ctx.accounts.token_program_2022.to_account_info();
+                    let memo          = ctx.accounts.memo_program.to_account_info();
+                    let in_mint       = ctx.accounts.input_vault_mint.to_account_info();
+                    let out_mint      = ctx.accounts.output_vault_mint.to_account_info();
 
-                let other_amount_threshold = if is_base_input {
-                    p.min_amount_out // min out
-                } else {
-                    p.other_amount_threshold // max in the other side
-                };
-                cpi::swap_v2(
-                    swap_ctx,
-                    swap_amount,
-                    other_amount_threshold,
-                    p.sqrt_price_limit_x64,
-                    is_base_input,
-                )?;
+                    let swap_accounts = cpi::accounts::SwapSingleV2 {
+                        payer: payer,
+                        amm_config: amm_cfg,
+                        pool_state: pool_state,
+                        input_token_account: in_acc,
+                        output_token_account: out_acc,
+                        input_vault: in_vault,
+                        output_vault: out_vault,
+                        observation_state: obs,
+                        token_program: token_prog,
+                        token_program_2022: token2022,
+                        memo_program: memo,
+                        input_vault_mint: in_mint,
+                        output_vault_mint: out_mint,
+                    };
 
-                // 计算实际花费与获得
+                    let other_amount_threshold = if is_base_input {
+                        p.min_amount_out
+                    } else {
+                        p.other_amount_threshold
+                    };
+
+                    let swap_ctx = CpiContext::new(clmm, swap_accounts)
+                        .with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
+
+                    cpi::swap_v2(
+                        swap_ctx,
+                        swap_amount,
+                        other_amount_threshold,
+                        p.sqrt_price_limit_x64,
+                        is_base_input,
+                    )?;
+                } // <- 结束 Block B，释放 AccountInfo 局部变量
+
+                // 成交后余额差
                 let post_out = get_token_balance(&ctx.accounts.output_token_account)?;
                 let post_in  = get_token_balance(&ctx.accounts.input_token_account)?;
                 let received = post_out.checked_sub(pre_out).ok_or(error!(OperationError::InvalidParams))?;
                 let spent    = pre_in.checked_sub(post_in).ok_or(error!(OperationError::InvalidParams))?;
                 let remaining = amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
 
-            // 直接默认没有个人头寸：无条件开仓
-             let open_ctx = CpiContext::new(
-                     ctx.accounts.clmm_program.to_account_info(),
-                     cpi::accounts::OpenPositionV2 {
-                             payer: ctx.accounts.operation_data.to_account_info(),
-                             pool_state: ctx.accounts.pool_state.to_account_info(),
-                             position_nft_owner: ctx.accounts.user.to_account_info(),
-                             position_nft_mint: ctx.accounts.position_nft_mint.to_account_info(),
-                             position_nft_account: ctx.accounts.position_nft_account.to_account_info(),
-                             personal_position: ctx.accounts.personal_position.to_account_info(),
-                             protocol_position: ctx.accounts.protocol_position.to_account_info(),
-                             tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
-                             tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-                             token_program: ctx.accounts.token_program.to_account_info(),
-                             system_program: ctx.accounts.system_program.to_account_info(),
-                             rent: ctx.accounts.rent.to_account_info(),
-                             associated_token_program: ctx.accounts.associated_token_program.to_account_info(),
-                             token_account_0: ctx.accounts.token_account_0.to_account_info(),
-                             token_account_1: ctx.accounts.token_account_1.to_account_info(),
-                             token_vault_0: ctx.accounts.input_vault.to_account_info(),
-                             token_vault_1: ctx.accounts.output_vault.to_account_info(),
-                             vault_0_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                             vault_1_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                             metadata_program: ctx.accounts.metadata_program.to_account_info(),
-                             metadata_account: ctx.accounts.metadata_account.to_account_info(),
-                             token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                        }
-                ).with_signer(signer_seeds)
-                .with_remaining_accounts(remaining_accounts.clone());
+                // ---------- Block C: open_position_v2 ----------
+                {
+                    let clmm            = ctx.accounts.clmm_program.to_account_info();
+                    let payer           = ctx.accounts.operation_data.to_account_info();
+                    let pool_state      = ctx.accounts.pool_state.to_account_info();
+                    let nft_owner       = ctx.accounts.user.to_account_info();
+                    let nft_mint        = ctx.accounts.position_nft_mint.to_account_info();
+                    let nft_account     = ctx.accounts.position_nft_account.to_account_info();
+                    let personal_pos    = ctx.accounts.personal_position.to_account_info();
+                    let protocol_pos    = ctx.accounts.protocol_position.to_account_info();
+                    let ta_lower        = ctx.accounts.tick_array_lower.to_account_info();
+                    let ta_upper        = ctx.accounts.tick_array_upper.to_account_info();
+                    let token_prog      = ctx.accounts.token_program.to_account_info();
+                    let sys_prog        = ctx.accounts.system_program.to_account_info();
+                    let rent            = ctx.accounts.rent.to_account_info();
+                    let ata_prog        = ctx.accounts.associated_token_program.to_account_info();
+                    let token_acc_0     = ctx.accounts.token_account_0.to_account_info();
+                    let token_acc_1     = ctx.accounts.token_account_1.to_account_info();
+                    let token_vault_0   = ctx.accounts.input_vault.to_account_info();
+                    let token_vault_1   = ctx.accounts.output_vault.to_account_info();
+                    let vault_0_mint    = ctx.accounts.input_vault_mint.to_account_info();
+                    let vault_1_mint    = ctx.accounts.output_vault_mint.to_account_info();
+                    let metadata_prog   = ctx.accounts.metadata_program.to_account_info();
+                    let metadata        = ctx.accounts.metadata_account.to_account_info();
+                    let token2022       = ctx.accounts.token_program_2022.to_account_info();
 
-                let tick_lower_index:i32 = 1; // TODO
-                let tick_upper_index: i32 = 1; // TODO
-                let tick_array_lower_start_index = 1; // TODO
-                let tick_array_upper_start_index = 1; // TODO
-                let liquidity = 1; // TODO
-                let amount_0_max = 2; // TODO
-                let amount_1_max = 12; // TODO
-                let with_matedata = false;
-                let base_flag = true;
-                cpi::open_position_v2(
-                    open_ctx,
-                    p.tick_lower,
-                    p.tick_upper,
-                    tick_array_lower_start_index,
-                    tick_array_upper_start_index,
-                    liquidity,
-                    amount_0_max,
-                    amount_1_max,
-                    with_matedata,
-                    Some(base_flag),
-                )?;
-                // 增加流动性（amount_0_max / amount_1_max 根据方向传值）
-                let (amount_0_max, amount_1_max) = if is_base_input {
-                    (remaining, received)
-                } else {
-                    (received, remaining)
-                };
+                    let open_accounts = cpi::accounts::OpenPositionV2 {
+                        payer: payer,
+                        pool_state: pool_state,
+                        position_nft_owner: nft_owner,
+                        position_nft_mint: nft_mint,
+                        position_nft_account: nft_account,
+                        personal_position: personal_pos,
+                        protocol_position: protocol_pos,
+                        tick_array_lower: ta_lower,
+                        tick_array_upper: ta_upper,
+                        token_program: token_prog,
+                        system_program: sys_prog,
+                        rent: rent,
+                        associated_token_program: ata_prog,
+                        token_account_0: token_acc_0,
+                        token_account_1: token_acc_1,
+                        token_vault_0: token_vault_0,
+                        token_vault_1: token_vault_1,
+                        vault_0_mint: vault_0_mint,
+                        vault_1_mint: vault_1_mint,
+                        metadata_program: metadata_prog,
+                        metadata_account: metadata,
+                        token_program_2022: token2022,
+                    };
 
-                let inc_ctx = CpiContext::new(
-                    ctx.accounts.clmm_program.to_account_info(),
-                    cpi::accounts::IncreaseLiquidityV2 {
-                        nft_owner: ctx.accounts.user.to_account_info(),
-                        nft_account: ctx.accounts.position_nft_account.to_account_info(),
-                        pool_state: ctx.accounts.pool_state.to_account_info(),
-                        protocol_position: ctx.accounts.protocol_position.to_account_info(),
-                        personal_position: ctx.accounts.personal_position.to_account_info(),
-                        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
-                        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-                        token_account_0: ctx.accounts.input_token_account.to_account_info(),
-                        token_account_1: ctx.accounts.output_token_account.to_account_info(),
-                        token_vault_0: ctx.accounts.input_vault.to_account_info(),
-                        token_vault_1: ctx.accounts.output_vault.to_account_info(),
-                        token_program: ctx.accounts.token_program.to_account_info(),
-                        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                        vault_0_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                        vault_1_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                    }
-                ).with_signer(signer_seeds)
-                    .with_remaining_accounts(remaining_accounts.clone());
+                    let open_ctx = CpiContext::new(clmm, open_accounts)
+                        .with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
 
-                cpi::increase_liquidity_v2(
-                    inc_ctx,
-                    0,                // 让 Raydium 计算 liquidity
-                    amount_0_max,
-                    amount_1_max,
-                    Some(is_base_input),
-                )?;
-            },
+                    // TODO: pass real value
+                    let tick_array_lower_start_index = 1;
+                    let tick_array_upper_start_index = 1;
+                    let liquidity = 1u128;
+                    let amount_0_max_dummy = 2u64;
+                    let amount_1_max_dummy = 12u64;
+                    let with_matedata = false;
+                    let base_flag = true;
+
+                    cpi::open_position_v2(
+                        open_ctx,
+                        p.tick_lower,
+                        p.tick_upper,
+                        tick_array_lower_start_index,
+                        tick_array_upper_start_index,
+                        liquidity,
+                        amount_0_max_dummy,
+                        amount_1_max_dummy,
+                        with_matedata,
+                        Some(base_flag),
+                    )?;
+                }
+
+                {
+                    let (amount_0_max, amount_1_max) = if is_base_input {
+                        (remaining, received)
+                    } else {
+                        (received, remaining)
+                    };
+
+                    let clmm          = ctx.accounts.clmm_program.to_account_info();
+                    let nft_owner       = ctx.accounts.user.to_account_info();
+                    let nft_account     = ctx.accounts.position_nft_account.to_account_info();
+                    let pool_state      = ctx.accounts.pool_state.to_account_info();
+                    let protocol_pos    = ctx.accounts.protocol_position.to_account_info();
+                    let personal_pos    = ctx.accounts.personal_position.to_account_info();
+                    let ta_lower        = ctx.accounts.tick_array_lower.to_account_info();
+                    let ta_upper        = ctx.accounts.tick_array_upper.to_account_info();
+                    let token_acc_0     = ctx.accounts.input_token_account.to_account_info();
+                    let token_acc_1     = ctx.accounts.output_token_account.to_account_info();
+                    let token_vault_0   = ctx.accounts.input_vault.to_account_info();
+                    let token_vault_1   = ctx.accounts.output_vault.to_account_info();
+                    let token_prog      = ctx.accounts.token_program.to_account_info();
+                    let token2022       = ctx.accounts.token_program_2022.to_account_info();
+                    let v0_mint         = ctx.accounts.input_vault_mint.to_account_info();
+                    let v1_mint         = ctx.accounts.output_vault_mint.to_account_info();
+
+                    let inc_accounts = cpi::accounts::IncreaseLiquidityV2 {
+                        nft_owner: nft_owner  ,
+                        nft_account: nft_account  ,
+                        pool_state: pool_state  ,
+                        protocol_position: protocol_pos  ,
+                        personal_position: personal_pos  ,
+                        tick_array_lower: ta_lower  ,
+                        tick_array_upper: ta_upper  ,
+                        token_account_0: token_acc_0  ,
+                        token_account_1: token_acc_1  ,
+                        token_vault_0: token_vault_0  ,
+                        token_vault_1: token_vault_1  ,
+                        token_program: token_prog  ,
+                        token_program_2022: token2022  ,
+                        vault_0_mint: v0_mint  ,
+                        vault_1_mint: v1_mint  ,
+                    };
+
+                    let inc_ctx = CpiContext::new(clmm  , inc_accounts)
+                        .with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
+
+                    cpi::increase_liquidity_v2(
+                        inc_ctx,
+                        0, // Raydium calculate liquidity
+                        amount_0_max,
+                        amount_1_max,
+                        Some(is_base_input),
+                    )?;
+                }
+            }
+
             OperationType::ZapOut => {
                 let p: ZapOutParams = deserialize_params(&action)?;
 
                 // Basic auth and routing checks
                 require!(ctx.accounts.recipient_token_account.owner == p.recipient, OperationError::Unauthorized);
-
-                // Ensure the working token accounts are controlled by our PDA, since the PDA will sign.
                 require!(ctx.accounts.input_token_account.owner == ctx.accounts.operation_data.key(), OperationError::Unauthorized);
                 require!(ctx.accounts.output_token_account.owner == ctx.accounts.operation_data.key(), OperationError::Unauthorized);
 
@@ -351,11 +390,11 @@ pub mod dg_solana_programs {
 
                 let remaining_accounts = ctx.remaining_accounts.to_vec();
 
-                // 赎回前余额（PDA 自持的两侧 token 账户）
+                // 赎回前余额
                 let pre0 = get_token_balance(&ctx.accounts.input_token_account)?;
                 let pre1 = get_token_balance(&ctx.accounts.output_token_account)?;
 
-                // 读取仓位可用流动性 & 准备 burn 数量
+                // 流动性与 tick 信息读取（不带出引用）
                 let full_liquidity: u128 = ctx.accounts.personal_position.liquidity;
                 require!(full_liquidity > 0, OperationError::InvalidParams);
                 let burn_liquidity_u128: u128 = if p.liquidity_to_burn_u64 > 0 {
@@ -365,12 +404,9 @@ pub mod dg_solana_programs {
                 };
                 require!(burn_liquidity_u128 <= full_liquidity, OperationError::InvalidParams);
 
-                // ====== 新增：用 tick 与当前价格预估赎回数量，并做滑点保护 ======
-                // 从个人仓位中读取 tick 边界（Raydium v3 的 PersonalPositionState 通常带有这两个字段）
                 let tick_lower = ctx.accounts.personal_position.tick_lower_index;
                 let tick_upper = ctx.accounts.personal_position.tick_upper_index;
 
-                // 计算 sa、sb（Q64.64），从池子拿 sp
                 let sa = tick_math::get_sqrt_price_at_tick(tick_lower)
                     .map_err(|_| error!(OperationError::InvalidParams))?;
                 let sb = tick_math::get_sqrt_price_at_tick(tick_upper)
@@ -381,53 +417,60 @@ pub mod dg_solana_programs {
                     let pool = ctx.accounts.pool_state.load()?;
                     pool.sqrt_price_x64
                 };
-                // 预估赎回数量（会落在 PDA 的 input_token_account / output_token_account）
-                let (est0, est1) = amounts_from_liquidity_burn_q64(sa, sb, sp, burn_liquidity_u128);
 
-                // 按固定常量滑点做最小接收
+                let (est0, est1) = amounts_from_liquidity_burn_q64(sa, sb, sp, burn_liquidity_u128);
                 let min0 = apply_slippage_min(est0, p.slippage_bps);
                 let min1 = apply_slippage_min(est1, p.slippage_bps);
 
-                let remaining_accounts = ctx.remaining_accounts.to_vec();
-                let pre0 = get_token_balance(&ctx.accounts.input_token_account)?;
-                let pre1 = get_token_balance(&ctx.accounts.output_token_account)?;
+                {
+                    let clmm            = ctx.accounts.clmm_program.to_account_info();
+                    let nft_owner       = ctx.accounts.user.to_account_info();
+                    let nft_account     = ctx.accounts.position_nft_account.to_account_info();
+                    let pool_state      = ctx.accounts.pool_state.to_account_info();
+                    let protocol_pos    = ctx.accounts.protocol_position.to_account_info();
+                    let personal_pos    = ctx.accounts.personal_position.to_account_info();
+                    let ta_lower        = ctx.accounts.tick_array_lower.to_account_info();
+                    let ta_upper        = ctx.accounts.tick_array_upper.to_account_info();
+                    let rec0            = ctx.accounts.recipient_token_account_0.to_account_info();
+                    let rec1            = ctx.accounts.recipient_token_account_1.to_account_info();
+                    let token_vault_0   = ctx.accounts.input_vault.to_account_info();
+                    let token_vault_1   = ctx.accounts.output_vault.to_account_info();
+                    let token_prog      = ctx.accounts.token_program.to_account_info();
+                    let token2022       = ctx.accounts.token_program_2022.to_account_info();
+                    let v0_mint         = ctx.accounts.input_vault_mint.to_account_info();
+                    let v1_mint         = ctx.accounts.output_vault_mint.to_account_info();
+                    let memo            = ctx.accounts.memo_program.to_account_info();
 
-                // 1) 先减少流动性（将代币赎回到 PDA 账上），这次把 min0/min1 传进去做严格保护
-                let dec_ctx = CpiContext::new(
-                    ctx.accounts.clmm_program.to_account_info(),
-                    cpi::accounts::DecreaseLiquidityV2 {
-                        nft_owner: ctx.accounts.user.to_account_info(),
-                        nft_account: ctx.accounts.position_nft_account.to_account_info(),
-                        pool_state: ctx.accounts.pool_state.to_account_info(),
-                        protocol_position: ctx.accounts.protocol_position.to_account_info(),
-                        personal_position: ctx.accounts.personal_position.to_account_info(),
-                        tick_array_lower: ctx.accounts.tick_array_lower.to_account_info(),
-                        tick_array_upper: ctx.accounts.tick_array_upper.to_account_info(),
-                        recipient_token_account_0: ctx.accounts.recipient_token_account_0.to_account_info(),
-                        recipient_token_account_1: ctx.accounts.recipient_token_account_1.to_account_info(),
-                        token_vault_0: ctx.accounts.input_vault.to_account_info(),
-                        token_vault_1: ctx.accounts.output_vault.to_account_info(),
-                        token_program: ctx.accounts.token_program.to_account_info(),
-                        token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                        vault_0_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                        vault_1_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                        memo_program: ctx.accounts.memo_program.to_account_info(),
-                    }
-                ).with_signer(signer_seeds)
-                    .with_remaining_accounts(remaining_accounts.clone());
+                    let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
+                        nft_owner: nft_owner ,
+                        nft_account: nft_account ,
+                        pool_state: pool_state ,
+                        protocol_position: protocol_pos ,
+                        personal_position: personal_pos,
+                        tick_array_lower: ta_lower,
+                        tick_array_upper: ta_upper,
+                        recipient_token_account_0: rec0,
+                        recipient_token_account_1: rec1,
+                        token_vault_0: token_vault_0,
+                        token_vault_1: token_vault_1,
+                        token_program: token_prog,
+                        token_program_2022: token2022,
+                        vault_0_mint: v0_mint,
+                        vault_1_mint: v1_mint,
+                        memo_program: memo,
+                    };
 
-                let (amount_0_max, amount_1_max) = if is_base_input {
-                    (remaining, received)
-                } else {
-                    (received, remaining)
-                };
+                    let dec_ctx = CpiContext::new(clmm, dec_accounts)
+                        .with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
 
-                cpi::decrease_liquidity_v2(
-                    dec_ctx,
-                    burn_liquidity_u128,
-                    min0,  // amount_0_min
-                    min1,  // amount_1_min
-                )?;
+                    cpi::decrease_liquidity_v2(
+                        dec_ctx,
+                        burn_liquidity_u128,
+                        min0,
+                        min1,
+                    )?;
+                }
 
                 // 实际到账
                 let post0 = get_token_balance(&ctx.accounts.input_token_account)?;
@@ -435,62 +478,73 @@ pub mod dg_solana_programs {
                 let got0 = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
                 let got1 = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
 
-                // 2) 若需要单边：把“另一侧”换成目标侧
-                let (mut total_out, mut swap_amount, is_base_input, swap_ctx) = if p.want_base {
-                    // 目标：mint_0（base）→ 把 got1（quote）换成 mint_0
-                    let swap_ctx = CpiContext::new(
-                        ctx.accounts.clmm_program.to_account_info(),
-                        cpi::accounts::SwapSingleV2 {
-                            payer: ctx.accounts.operation_data.to_account_info(),
-                            amm_config: ctx.accounts.amm_config.to_account_info(),
-                            pool_state: ctx.accounts.pool_state.to_account_info(),
-                            input_token_account: ctx.accounts.output_token_account.to_account_info(),
-                            output_token_account: ctx.accounts.input_token_account.to_account_info(),
-                            input_vault: ctx.accounts.output_vault.to_account_info(),
-                            output_vault: ctx.accounts.input_vault.to_account_info(),
-                            observation_state: ctx.accounts.observation_state.to_account_info(),
-                            token_program: ctx.accounts.token_program.to_account_info(),
-                            token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                            memo_program: ctx.accounts.memo_program.to_account_info(),
-                            input_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                            output_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                        },
-                    ).with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
-                    (got0, got1, false, swap_ctx)
+                // 需要单边时的 swap
+                let (mut total_out, mut swap_amount, is_base_input) = if p.want_base {
+                    (got0, got1, false)
                 } else {
-                    // 目标：mint_1（quote）→ 把 got0（base）换成 mint_1
-                    let swap_ctx = CpiContext::new(
-                        ctx.accounts.clmm_program.to_account_info(),
-                        cpi::accounts::SwapSingleV2 {
-                            payer: ctx.accounts.operation_data.to_account_info(),
-                            amm_config: ctx.accounts.amm_config.to_account_info(),
-                            pool_state: ctx.accounts.pool_state.to_account_info(),
-                            input_token_account: ctx.accounts.input_token_account.to_account_info(),
-                            output_token_account: ctx.accounts.output_token_account.to_account_info(),
-                            input_vault: ctx.accounts.input_vault.to_account_info(),
-                            output_vault: ctx.accounts.output_vault.to_account_info(),
-                            observation_state: ctx.accounts.observation_state.to_account_info(),
-                            token_program: ctx.accounts.token_program.to_account_info(),
-                            token_program_2022: ctx.accounts.token_program_2022.to_account_info(),
-                            memo_program: ctx.accounts.memo_program.to_account_info(),
-                            input_vault_mint: ctx.accounts.input_vault_mint.to_account_info(),
-                            output_vault_mint: ctx.accounts.output_vault_mint.to_account_info(),
-                        },
-                    ).with_signer(signer_seeds)
-                        .with_remaining_accounts(remaining_accounts.clone());
-                    (got1, got0, true, swap_ctx)
+                    (got1, got0, true)
                 };
 
-
                 if swap_amount > 0 {
-                    cpi::swap_v2(
-                        swap_ctx,
-                        swap_amount,
-                        p.other_amount_threshold,
-                        p.sqrt_price_limit_x64,
-                        is_base_input,
-                    )?;
+                    // ---------- Block F: swap_v2 for one-sided exit ----------
+                    {
+                        let clmm       = ctx.accounts.clmm_program.to_account_info();
+                        let payer      = ctx.accounts.operation_data.to_account_info();
+                        let amm_cfg    = ctx.accounts.amm_config.to_account_info();
+                        let pool_state = ctx.accounts.pool_state.to_account_info();
+                        let (in_acc, out_acc, in_vault, out_vault, in_mint, out_mint) =
+                            if p.want_base {
+                                (
+                                    ctx.accounts.output_token_account.to_account_info(),
+                                    ctx.accounts.input_token_account.to_account_info(),
+                                    ctx.accounts.output_vault.to_account_info(),
+                                    ctx.accounts.input_vault.to_account_info(),
+                                    ctx.accounts.output_vault_mint.to_account_info(),
+                                    ctx.accounts.input_vault_mint.to_account_info(),
+                                )
+                            } else {
+                                (
+                                    ctx.accounts.input_token_account.to_account_info(),
+                                    ctx.accounts.output_token_account.to_account_info(),
+                                    ctx.accounts.input_vault.to_account_info(),
+                                    ctx.accounts.output_vault.to_account_info(),
+                                    ctx.accounts.input_vault_mint.to_account_info(),
+                                    ctx.accounts.output_vault_mint.to_account_info(),
+                                )
+                            };
+                        let obs        = ctx.accounts.observation_state.to_account_info();
+                        let token_prog = ctx.accounts.token_program.to_account_info();
+                        let token2022  = ctx.accounts.token_program_2022.to_account_info();
+                        let memo       = ctx.accounts.memo_program.to_account_info();
+
+                        let swap_accounts = cpi::accounts::SwapSingleV2 {
+                            payer: payer,
+                            amm_config: amm_cfg,
+                            pool_state: pool_state,
+                            input_token_account: in_acc,
+                            output_token_account: out_acc,
+                            input_vault: in_vault,
+                            output_vault: out_vault,
+                            observation_state: obs,
+                            token_program: token_prog,
+                            token_program_2022: token2022,
+                            memo_program: memo,
+                            input_vault_mint: in_mint,
+                            output_vault_mint: out_mint,
+                        };
+
+                        let swap_ctx = CpiContext::new(clmm, swap_accounts)
+                            .with_signer(signer_seeds)
+                            .with_remaining_accounts(remaining_accounts.clone());
+
+                        cpi::swap_v2(
+                            swap_ctx,
+                            swap_amount,
+                            p.other_amount_threshold,
+                            p.sqrt_price_limit_x64,
+                            is_base_input,
+                        )?;
+                    }
 
                     // 刷新单边后的总量
                     if p.want_base {
@@ -501,37 +555,70 @@ pub mod dg_solana_programs {
                         total_out = new_quote.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
                     }
                 }
-                // 3) 最低支付保护
-                require!(total_out >= p.min_payout, OperationError::InvalidParams);
-                require!(total_out >= amount, OperationError::InvalidParams); // `amount` 来自 OperationData
 
-                // 4) 把目标侧的币转给 recipient
-                let from_ai = if p.want_base {
+                // 最低支付保护
+                require!(total_out >= p.min_payout, OperationError::InvalidParams);
+                require!(total_out >= amount, OperationError::InvalidParams);
+
+                // 输出到 recipient
+                let from = if p.want_base {
                     ctx.accounts.input_token_account.to_account_info()
                 } else {
                     ctx.accounts.output_token_account.to_account_info()
                 };
 
                 let cpi_accounts = Transfer {
-                    from: from_ai,
+                    from: from,
                     to: ctx.accounts.recipient_token_account.to_account_info(),
                     authority: ctx.accounts.operation_data.to_account_info(),
                 };
                 token::transfer(
-                    CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds),
+                    CpiContext::new_with_signer(token_program, cpi_accounts, signer_seeds),
                     total_out,
                 )?;
-                // 如果流动性全部claim完， 调用Raydium 的close_position
 
+                // 若仓位已空，关闭仓位
+                if ctx.accounts.personal_position.liquidity == 0 {
+                    // 根据你使用的 Raydium SDK 版本，选择 ClosePosition 或 ClosePositionV2
+                    let clmm         = ctx.accounts.clmm_program.to_account_info();
+                    let payer        = ctx.accounts.operation_data.to_account_info();
+                    let pool_state   = ctx.accounts.pool_state.to_account_info();
+                    let protocol_pos = ctx.accounts.protocol_position.to_account_info();
+                    let personal_pos = ctx.accounts.personal_position.to_account_info();
+                    let nft_owner    = ctx.accounts.user.to_account_info();
+                    let nft_mint     = ctx.accounts.position_nft_mint.to_account_info();
+                    let nft_account  = ctx.accounts.position_nft_account.to_account_info();
+                    let token_prog   = ctx.accounts.token_program.to_account_info();
+                    let token2022    = ctx.accounts.token_program_2022.to_account_info();
+                    let sys_prog     = ctx.accounts.system_program.to_account_info();
+                    let metadata_prog= ctx.accounts.metadata_program.to_account_info();
+                    let metadata     = ctx.accounts.metadata_account.to_account_info();
+
+                    // 这里示例用 V2（你前面 open/inc/dec 都用 V2）
+                    let close_accounts = cpi::accounts::ClosePosition {
+                        nft_owner: protocol_pos,
+                        personal_position: personal_pos,
+                        position_nft_mint: nft_mint,
+                        position_nft_account: nft_account,
+                        token_program: token_prog,
+                        system_program: sys_prog,
+                    };
+
+                    let close_ctx = CpiContext::new(clmm, close_accounts)
+                        .with_signer(signer_seeds)
+                        .with_remaining_accounts(remaining_accounts.clone());
+
+                    cpi::close_position(close_ctx)?;
+                    msg!("Position closed and NFT burned.");
+                }
             }
         }
 
-        {
-            let od_rw = &mut ctx.accounts.operation_data;
-            od_rw.executed = true;
-        }
+        // 函数末尾再短借用一次写回
+        ctx.accounts.operation_data.executed = true;
         Ok(())
     }
+
     // Modify PDA Authority
     pub fn modify_pda_authority(
         ctx: Context<ModifyPdaAuthority>,
@@ -553,8 +640,8 @@ pub mod dg_solana_programs {
     }
 }
 
-
 const Q64_U128: u128 = 1u128 << 64;
+
 #[inline]
 fn amounts_from_liquidity_burn_q64(
     sa: u128,    // sqrt(P_lower) in Q64.64
@@ -562,58 +649,33 @@ fn amounts_from_liquidity_burn_q64(
     sp: u128,    // sqrt(P_current) in Q64.64
     d_liq: u128, // ΔL (liquidity to burn)
 ) -> (u64, u64) {
-    // 基本校验
     assert!(sa < sb, "invalid tick bounds");
     if d_liq == 0 {
         return (0, 0);
     }
-
-    // 转成大整数
     let sa_u = U256::from(sa);
     let sb_u = U256::from(sb);
     let sp_u = U256::from(sp);
     let dL_u = U256::from(d_liq);
     let q64  = U256::from(Q64_U128);
-
-    // 计算差值（按分支保证不会下溢）
     let diff_sb_sa = sb_u - sa_u;
 
-    // 分支计算
     let (amount0_u256, amount1_u256) = if sp_u <= sa_u {
-        // —— 全部以 token0 赎回：
-        // amount0 = floor( ΔL * (sb - sa) * Q / (sa * sb) )
-        // amount1 = 0
-        let num0 = dL_u * diff_sb_sa * q64; // ΔL * (sb - sa) * Q
-        let den0 = sa_u * sb_u;             // sa * sb
-        // 安全除法（若 den0 为 0，不太可能，但兜底为 0）
-        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::ZERO);
-        (a0, U256::ZERO)
+        let num0 = dL_u * diff_sb_sa * q64;
+        let den0 = sa_u * sb_u;
+        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::from(0));
+        (a0, U256::from(0))
     } else if sp_u >= sb_u {
-        // —— 全部以 token1 赎回：
-        // amount0 = 0
-        // amount1 = floor( ΔL * (sb - sa) / Q )
-        let a1 = (dL_u * diff_sb_sa)
-            .mul_div_floor(U256::from(1u8), q64)
-            .unwrap_or(U256::ZERO);
-        (U256::ZERO, a1)
+        let a1 = (dL_u * diff_sb_sa).mul_div_floor(U256::from(1u8), q64).unwrap_or(U256::from(0));
+        (U256::from(0), a1)
     } else {
-        // —— 价格位于区间内：双边赎回
-        // amount0 = floor( ΔL * (sb - sp) * Q / (sp * sb) )
-        // amount1 = floor( ΔL * (sp - sa) / Q )
-        let num0 = dL_u * (sb_u - sp_u) * q64; // ΔL * (sb - sp) * Q
-        let den0 = sp_u * sb_u;                // sp * sb
-        let a0 = num0
-            .mul_div_floor(U256::from(1u8), den0)
-            .unwrap_or(U256::ZERO);
-
-        let a1 = (dL_u * (sp_u - sa_u))
-            .mul_div_floor(U256::from(1u8), q64)
-            .unwrap_or(U256::ZERO);
-
+        let num0 = dL_u * (sb_u - sp_u) * q64;
+        let den0 = sp_u * sb_u;
+        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::from(0));
+        let a1 = (dL_u * (sp_u - sa_u)).mul_div_floor(U256::from(1u8), q64).unwrap_or(U256::from(0));
         (a0, a1)
     };
 
-    // 转成 SPL 常用的 u64（使用 Raydium big_num 的 to_underflow_u64）
     let amount0 = amount0_u256.to_underflow_u64();
     let amount1 = amount1_u256.to_underflow_u64();
     (amount0, amount1)
@@ -621,7 +683,6 @@ fn amounts_from_liquidity_burn_q64(
 
 #[inline]
 fn apply_slippage_min(estimate: u64, bps: u32) -> u64 {
-    // 最小接收 = 估值 * (1 - bps/10000)
     let num = (estimate as u128) * (10_000u128 - bps as u128);
     (num / 10_000u128) as u64
 }
@@ -634,7 +695,6 @@ fn get_token_balance(acc: &InterfaceAccount<InterfaceTokenAccount>) -> Result<u6
 fn deserialize_params<T: AnchorDeserialize>(data: &[u8]) -> Result<T> {
     T::try_from_slice(data).map_err(|_| error!(OperationError::InvalidParams))
 }
-
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {
@@ -666,9 +726,9 @@ pub struct Deposit<'info> {
     pub authority: Signer<'info>,
     #[account(
         mut,
-        constraint = authority_ata.owner == authority.key() @ OperationError::Unauthorized // Changed to check authority ownership
+        constraint = authority_ata.owner == authority.key() @ OperationError::Unauthorized
     )]
-    pub authority_ata: Account<'info, TokenAccount>, // Changed from user_ata to authority_ata
+    pub authority_ata: Account<'info, TokenAccount>,
     #[account(
         mut,
         constraint = program_token_account.owner == operation_data.key() @ OperationError::InvalidProgramAccount
@@ -679,6 +739,7 @@ pub struct Deposit<'info> {
     )]
     pub token_program: Program<'info, Token>,
 }
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct PositionBounds {
     pub tick_lower: i32,
@@ -694,18 +755,17 @@ pub struct Execute<'info> {
         bump
     )]
     pub operation_data: Box<Account<'info, OperationData>>,
-    #[account(mut)]
-    pub program_token_account: Box<Account<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]
-    pub recipient_token_account: Box<Account<'info, InterfaceTokenAccount>>, // concrete, fine
+    pub program_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+    #[account(mut)]
+    pub recipient_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]
     pub user: Signer<'info>,
 
     #[account(mut, constraint = input_token_account.mint == input_vault_mint.key())]
     pub input_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
     #[account(mut, constraint = output_token_account.mint == output_vault_mint.key())]
     pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
@@ -719,7 +779,6 @@ pub struct Execute<'info> {
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    // pool vaults should be interface accounts too
     #[account(mut, address = pool_state.load()?.token_vault_0)]
     pub input_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
     #[account(mut, address = pool_state.load()?.token_vault_1)]
@@ -728,7 +787,6 @@ pub struct Execute<'info> {
     #[account(mut, address = pool_state.load()?.observation_key)]
     pub observation_state: AccountLoader<'info, ObservationState>,
 
-    // these constraints now reference interface mints
     #[account(address = pool_state.load()?.token_mint_0)]
     pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
     #[account(address = pool_state.load()?.token_mint_1)]
@@ -737,24 +795,21 @@ pub struct Execute<'info> {
     #[account(address = spl_memo::id())]
     pub memo_program: UncheckedAccount<'info>,
 
-    #[account(
-        constraint = clmm_program.key() == RAYDIUM_CLMM_PROGRAM_ID
-    )]
+    #[account(constraint = clmm_program.key() == RAYDIUM_CLMM_PROGRAM_ID)]
     pub clmm_program: Program<'info, AmmV3>,
 
     /// The destination token account for receive amount_0
     #[account(
         mut,
-        token::mint = token_vault_0.mint
+        constraint = recipient_token_account_0.mint == token_vault_0.mint
     )]
-    pub recipient_token_account_0: Box<InterfaceAccount<'info, TokenAccount>>,
-
+    pub recipient_token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
     /// The destination token account for receive amount_1
     #[account(
         mut,
-        token::mint = token_vault_1.mint
+        constraint = recipient_token_account_1.mint == token_vault_1.mint
     )]
-    pub recipient_token_account_1: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub recipient_token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(
         mut,
@@ -772,7 +827,6 @@ pub struct Execute<'info> {
 
     pub personal_position: Box<Account<'info, PersonalPositionState>>,
 
-
     pub rent: Sysvar<'info, Rent>,
 
     #[account(mut)]
@@ -782,19 +836,17 @@ pub struct Execute<'info> {
 
     #[account(
         mut,
-        token::mint = token_vault_0.mint
+        constraint = token_account_0.mint == token_vault_0.mint
     )]
     pub token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
     #[account(
         mut,
-        token::mint = token_vault_1.mint
+        constraint = token_account_1.mint == token_vault_1.mint
     )]
     pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]
     pub metadata_account: UncheckedAccount<'info>,
-
     pub metadata_program: Program<'info, Metadata>,
 
     #[account(
@@ -802,17 +854,13 @@ pub struct Execute<'info> {
         constraint = token_vault_0.key() == pool_state.load()?.token_vault_0
     )]
     pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    /// The address that holds pool tokens for token_1
     #[account(
         mut,
         constraint = token_vault_1.key() == pool_state.load()?.token_vault_1
     )]
     pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
-    /// Associated Token Program
     pub associated_token_program: Program<'info, AssociatedToken>,
-
 
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
@@ -834,9 +882,7 @@ pub struct ModifyPdaAuthority<'info> {
 }
 
 // Helper function to get swapped amount (placeholder; implement based on your needs)
-fn get_swapped_amount(_output_token_account: &InterfaceAccount<TokenAccount>) -> Result<u64> {
-    // Fetch the actual swapped amount from output_token_account balance
-    // This is a placeholder; you may need to track the balance change
+fn get_swapped_amount(_output_token_account: &InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
     Ok(0)
 }
 
@@ -852,6 +898,7 @@ pub struct OperationData {
     pub amount: u64,
     pub executed: bool,
 }
+
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
 pub enum OperationType {
     Transfer,
@@ -871,37 +918,29 @@ pub struct TransferParams {
     pub recipient: Pubkey,
 }
 
-// Parameters for ZapIn operation (Raydium CLMM)
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ZapInParams {
-    pub amount_in: u64,       // Amount of input token to zap in
-    pub min_amount_out: u64,  // Minimum output token received from swap
-    pub pool: Pubkey,         // Raydium CLMM pool address
-    pub token_a_mint: Pubkey, // Mint of token A (e.g., USDC)
-    pub token_b_mint: Pubkey, // Mint of token B (e.g., TSLAx)
-    pub tick_lower: i32,      // Lower tick for liquidity range
-    pub tick_upper: i32,      // Upper tick for liquidity range
+    pub amount_in: u64,
+    pub min_amount_out: u64,
+    pub pool: Pubkey,
+    pub token_a_mint: Pubkey,
+    pub token_b_mint: Pubkey,
+    pub tick_lower: i32,
+    pub tick_upper: i32,
     pub sqrt_price_limit_x64: u128,
     pub other_amount_threshold: u64,
-}
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct ZapOutParams {
-    /// If true, end with base token(mint_0), If false, end with quote token(mint_1)
-    pub want_base: bool,
-    /// Mint total tokens you ultimately send to recipient(same mint as the desired side).
-    pub min_payout: u64,
-    /// Swap constraints (only used if we need to convert the “other” side).
-    pub sqrt_price_limit_x64: u128,
-    pub other_amount_threshold: u64,
-    /// Who should receive the final token (checked against the provided ATA’s owner).
-    pub recipient: Pubkey,
-    /// If provided and > 0, burn exactly this liquidity. Otherwise burn all current liquidity.
-    /// (Raydium liquidity is u128; we accept u64 here and cast—good enough for many cases.
-    /// If you need full-precision control, switch to u128.)
-    pub liquidity_to_burn_u64: u64,
-    pub slippage_bps: u64,
 }
 
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct ZapOutParams {
+    pub want_base: bool,
+    pub min_payout: u64,
+    pub sqrt_price_limit_x64: u128,
+    pub other_amount_threshold: u64,
+    pub recipient: Pubkey,
+    pub liquidity_to_burn_u64: u64,
+    pub slippage_bps: u32,
+}
 
 impl OperationData {
     pub const LEN: usize =
@@ -936,5 +975,5 @@ pub enum OperationError {
     #[msg("Invalid tick range")]
     InvalidTickRange,
     #[msg("Invalid program account")]
-    InvalidProgramAccount
+    InvalidProgramAccount,
 }
