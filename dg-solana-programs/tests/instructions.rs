@@ -395,8 +395,6 @@ fn test_amounts_from_liquidity_burn_q64_boundaries() {
     assert_eq!((z0, z1), (0, 0));
 }
 
-/// ---------- execute 指令的骨架（需要 Raydium 本地池／夹具，默认忽略） ----------
-
 #[tokio::test]
 #[ignore]
 async fn execute_transfer_happy_path_skeleton() {
