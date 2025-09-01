@@ -107,7 +107,7 @@ pub mod dg_solana_programs {
         require!(!ctx.accounts.operation_data.executed, OperationError::AlreadyExecuted);
         require!(ctx.accounts.operation_data.amount > 0, OperationError::InvalidAmount);
 
-        let amount = ctx.accounts.operation_data.amount;
+        let amount = ctx.accounts.operation_data.amount; //
         let op_type = ctx.accounts.operation_data.operation_type.clone();
         let action  = ctx.accounts.operation_data.action.clone();
         let ca = ctx.accounts.operation_data.ca;
@@ -203,8 +203,9 @@ pub mod dg_solana_programs {
                 require!(frac_den > U256::from(0u8), OperationError::InvalidParams);
 
                 let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
+                let amount_in = p.amount_in;
 
-                let amount_in_u256 = U256::from(amount);
+                let amount_in_u256 = U256::from(amount_in); // User Input Amount
                 let swap_amount_u256 = if is_base_input {
                     amount_in_u256.mul_div_floor(r_num, frac_den).ok_or(error!(OperationError::InvalidParams))?
                 } else {
@@ -212,6 +213,24 @@ pub mod dg_solana_programs {
                 };
                 let swap_amount = swap_amount_u256.to_underflow_u64();
                 require!(swap_amount as u128 <= u64::MAX as u128, OperationError::InvalidParams);
+
+                let to_acc_info = if is_base_input {
+                    ctx.accounts.input_token_account.to_account_info()
+                } else {
+                    ctx.accounts.output_token_account.to_account_info()
+                };
+                // transfer from program_tokne_account -> input_token_account
+                let fund_move = anchor_spl::token::Transfer {
+                    from:      ctx.accounts.program_token_account.to_account_info(),
+                    to:        to_acc_info,
+                    authority: ctx.accounts.operation_data.to_account_info(), // PDA 作为 authority
+                };
+                let fund_move_ctx = CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    fund_move,
+                ).with_signer(signer_seeds);
+                // 把用户deposit进来的amount挪到ZapIn 那一侧
+                anchor_spl::token::transfer(fund_move_ctx, amount)?;
 
                 // 记录前后余额
                 let pre_out = get_token_balance(&mut ctx.accounts.output_token_account)?;
@@ -327,26 +346,35 @@ pub mod dg_solana_programs {
                     let open_ctx = CpiContext::new(clmm, open_accounts)
                         .with_signer(signer_seeds);
 
-                    // TODO: Pass real value
-                    let tick_array_lower_start_index = 1;
-                    let tick_array_upper_start_index = 1;
-                    let liquidity = 1u128;
-                    let amount_0_max_dummy = 2u64;
-                    let amount_1_max_dummy = 12u64;
-                    let with_matedata = false;
-                    let base_flag = true;
+                    let pool = ctx.accounts.pool_state.load()?;
+                    let tick_spacing: i32 = pool.tick_spacing.into();
+
+                    let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
+                    let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
+
+                    {
+                        let ta_lower = ctx.accounts.tick_array_lower.load()?;
+                        let ta_upper = ctx.accounts.tick_array_upper.load()?;
+
+                        require!(ta_lower.start_tick_index == lower_start, OperationError::InvalidParams);
+                        require!(ta_upper.start_tick_index == upper_start, OperationError::InvalidParams);
+                    }
+
+
+                    let with_metadata = false;
+                    let base_flag = Some(true);
 
                     cpi::open_position_v2(
                         open_ctx,
                         p.tick_lower,
                         p.tick_upper,
-                        tick_array_lower_start_index,
-                        tick_array_upper_start_index,
-                        liquidity,
-                        amount_0_max_dummy,
-                        amount_1_max_dummy,
-                        with_matedata,
-                        Some(base_flag),
+                        lower_start,
+                        upper_start,
+                        0u128,
+                        0u64,
+                        0u64,
+                        with_metadata,
+                        base_flag,
                     )?;
                 }
 
@@ -855,6 +883,18 @@ fn amounts_from_liquidity_burn_q64(
     let amount1 = amount1_u256.to_underflow_u64();
     (amount0, amount1)
 }
+const TICK_ARRAY_SIZE: i32 = 88; //Raydium/UniV3 每个 TickArray 覆盖 88 个 tick 间隔
+#[inline]
+fn tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
+    let span = tick_spacing * TICK_ARRAY_SIZE;
+    // floor 除法，处理负 tick
+    let q = if tick_index >= 0 {
+        tick_index / span
+    } else {
+        (tick_index - (span - 1)) / span
+    };
+    q * span
+}
 
 #[inline]
 fn apply_slippage_min(estimate: u64, bps: u32) -> u64 {
@@ -940,9 +980,15 @@ pub struct Execute<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    #[account(mut, constraint = input_token_account.mint == input_vault_mint.key())]
+    #[account(mut,
+    constraint = input_token_account.mint == input_vault_mint.key(),
+    constraint = input_token_account.owner == operation_data.key()
+    )]
     pub input_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, constraint = output_token_account.mint == output_vault_mint.key())]
+    #[account(mut,
+    constraint = output_token_account.mint == output_vault_mint.key(),
+    constraint = output_token_account.owner == operation_data.key()
+    )]
     pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]
