@@ -49,6 +49,7 @@ pub mod dg_solana_programs {
         operation_type: OperationType,
         action: Vec<u8>,
         amount: u64,
+        ca: Pubkey,
     ) -> Result<()> {
         let operation_data = &mut ctx.accounts.operation_data;
 
@@ -71,6 +72,7 @@ pub mod dg_solana_programs {
         operation_data.transfer_id = transfer_id.clone();
         operation_data.amount = amount;
         operation_data.executed = false;
+        operation_data.ca = ca;
 
         operation_data.operation_type = operation_type.clone();
         operation_data.action = action;
@@ -108,10 +110,12 @@ pub mod dg_solana_programs {
         let amount = ctx.accounts.operation_data.amount;
         let op_type = ctx.accounts.operation_data.operation_type.clone();
         let action  = ctx.accounts.operation_data.action.clone();
+        let ca = ctx.accounts.operation_data.ca;
 
         let bump = ctx.bumps.operation_data;
         let seeds: &[&[u8]] = &[b"operation_data", &[bump]];
         let signer_seeds: &[&[&[u8]]] = &[seeds];
+
 
         let token_program = ctx.accounts.token_program.to_account_info();
 
@@ -135,6 +139,41 @@ pub mod dg_solana_programs {
             OperationType::ZapIn => {
                 let p: ZapInParams = deserialize_params(&action)?;
                 require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
+
+                // check pool token_a_mint == ca
+                require!(p.token_a_mint == ca, OperationError::InvalidMint);
+
+                // --- if amount < p.amount_in then refund to user DA ---
+                if amount < p.amount_in {
+                    // sanity check: return fund account must be aligned with program token account
+                    require!(
+                         ctx.accounts.recipient_token_account.mint == ctx.accounts.program_token_account.mint,
+                         OperationError::InvalidMint
+                    );
+
+                    let refund_accounts = Transfer {
+                        from: ctx.accounts.program_token_account.to_account_info(),
+                        to: ctx.accounts.recipient_token_account.to_account_info(),
+                        authority: ctx.accounts.operation_data.to_account_info()
+                    };
+                    token::transfer(
+                        CpiContext::new_with_signer(
+                            token_program,
+                            refund_accounts,
+                            signer_seeds, // PDA as authority
+                        ),
+                        amount, // actual refund account
+                    )?;
+
+                    // make executed as true
+                    ctx.accounts.operation_data.executed = true;
+                    msg!(
+                        "ZapIn refund: expected amount_in = {}, received_amount = {}, refund all to recipient",
+                        p.amount_in,
+                        amount
+                    );
+                    return Ok(());
+                }
 
                 let sp = {
                     let pool = ctx.accounts.pool_state.load()?; // Ref<PoolState>
@@ -175,8 +214,8 @@ pub mod dg_solana_programs {
                 require!(swap_amount as u128 <= u64::MAX as u128, OperationError::InvalidParams);
 
                 // 记录前后余额
-                let pre_out = get_token_balance(&ctx.accounts.output_token_account)?;
-                let pre_in  = get_token_balance(&ctx.accounts.input_token_account)?;
+                let pre_out = get_token_balance(&mut ctx.accounts.output_token_account)?;
+                let pre_in  = get_token_balance(&mut ctx.accounts.input_token_account)?;
 
                 {
                     let clmm          = ctx.accounts.clmm_program.to_account_info();
@@ -229,8 +268,8 @@ pub mod dg_solana_programs {
                 }
 
                 // 成交后余额差
-                let post_out = get_token_balance(&ctx.accounts.output_token_account)?;
-                let post_in  = get_token_balance(&ctx.accounts.input_token_account)?;
+                let post_out = get_token_balance(&mut ctx.accounts.output_token_account)?;
+                let post_in  = get_token_balance(&mut ctx.accounts.input_token_account)?;
                 let received = post_out.checked_sub(pre_out).ok_or(error!(OperationError::InvalidParams))?;
                 let spent    = pre_in.checked_sub(post_in).ok_or(error!(OperationError::InvalidParams))?;
                 let remaining = amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
@@ -288,7 +327,7 @@ pub mod dg_solana_programs {
                     let open_ctx = CpiContext::new(clmm, open_accounts)
                         .with_signer(signer_seeds);
 
-                    // TODO: pass real value
+                    // TODO: Pass real value
                     let tick_array_lower_start_index = 1;
                     let tick_array_upper_start_index = 1;
                     let liquidity = 1u128;
@@ -366,6 +405,156 @@ pub mod dg_solana_programs {
                 }
             }
 
+
+            OperationType::Claim => {
+                let p: ClaimParams = deserialize_params(&action)?;
+                // 要求收款 ATA 的 mint 就是 USDC，且它必须与池子的 token0 或 token1 之一相等
+                let usdc_mint = ctx.accounts.recipient_token_account.mint;
+                require!(
+                    usdc_mint == ctx.accounts.input_vault_mint.key() || usdc_mint == ctx.accounts.output_vault_mint.key(),
+                    OperationError::InvalidMint
+                    );
+
+                // 记录 claim 前余额（PDA 名下的两边 Token 账户）
+                let pre0 = get_token_balance(&mut ctx.accounts.input_token_account)?;   // token0
+                let pre1 = get_token_balance(&mut ctx.accounts.output_token_account)?;  // token1
+                let pre_usdc = if usdc_mint == ctx.accounts.input_vault_mint.key() { pre0 } else { pre1 };
+
+                // ---- 第一步：只结算手续费（liquidity=0）----
+                // 注意：这里的收款账户指向 PDA 名下的两边 Token 账户（input_token_account/output_token_account），
+                // 这样便于后面直接做单边 swap。
+                {
+                    let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
+                        nft_owner:         ctx.accounts.user.to_account_info(),
+                        nft_account:       ctx.accounts.position_nft_account.to_account_info(),
+                        pool_state:        ctx.accounts.pool_state.to_account_info(),
+                        protocol_position: ctx.accounts.protocol_position.to_account_info(),
+                        personal_position: ctx.accounts.personal_position.to_account_info(),
+                        tick_array_lower:  ctx.accounts.tick_array_lower.to_account_info(),
+                        tick_array_upper:  ctx.accounts.tick_array_upper.to_account_info(),
+                        recipient_token_account_0: ctx.accounts.input_token_account.to_account_info(),   // token0 -> PDA
+                        recipient_token_account_1: ctx.accounts.output_token_account.to_account_info(),  // token1 -> PDA
+                        token_vault_0:     ctx.accounts.token_vault_0.to_account_info(),
+                        token_vault_1:     ctx.accounts.token_vault_1.to_account_info(),
+                        token_program:     ctx.accounts.token_program.to_account_info(),
+                        token_program_2022:ctx.accounts.token_program_2022.to_account_info(),
+                        vault_0_mint:      ctx.accounts.input_vault_mint.to_account_info(),
+                        vault_1_mint:      ctx.accounts.output_vault_mint.to_account_info(),
+                        memo_program:      ctx.accounts.memo_program.to_account_info(),
+                    };
+                    let dec_ctx = CpiContext::new(
+                        ctx.accounts.clmm_program.to_account_info(),
+                        dec_accounts,
+                    ).with_signer(signer_seeds);
+                    // Only claim：liquidity=0，minimum value is 0
+                    cpi::decrease_liquidity_v2(dec_ctx, 0u128, 0u64, 0u64)?;
+                }
+
+                // 计算刚刚 claim 到手的手续费数量
+                let post0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
+                let post1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
+                let got0 = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
+                let got1 = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
+
+                // ---- 第二步：把非 USDC 的一边全部换成 USDC ----
+                let mut total_usdc_after_swap: u64;
+                if usdc_mint == ctx.accounts.input_vault_mint.key() {
+                    // USDC 是 token0，需把 got1(=token1) 全部换成 token0
+                    total_usdc_after_swap = pre_usdc + got0; // 先加上 token0 的手续费
+                    if got1 > 0 {
+                        let swap_accounts = cpi::accounts::SwapSingleV2 {
+                            payer:               ctx.accounts.operation_data.to_account_info(),
+                            amm_config:          ctx.accounts.amm_config.to_account_info(),
+                            pool_state:          ctx.accounts.pool_state.to_account_info(),
+                            input_token_account: ctx.accounts.output_token_account.to_account_info(), // in: token1 (PDA)
+                            output_token_account:ctx.accounts.input_token_account.to_account_info(),  // out: token0 (PDA)
+                            input_vault:         ctx.accounts.output_vault.to_account_info(),         // vault1
+                            output_vault:        ctx.accounts.input_vault.to_account_info(),          // vault0
+                            observation_state:   ctx.accounts.observation_state.to_account_info(),
+                            token_program:       ctx.accounts.token_program.to_account_info(),
+                            token_program_2022:  ctx.accounts.token_program_2022.to_account_info(),
+                            memo_program:        ctx.accounts.memo_program.to_account_info(),
+                            input_vault_mint:    ctx.accounts.output_vault_mint.to_account_info(),
+                            output_vault_mint:   ctx.accounts.input_vault_mint.to_account_info(),
+                        };
+                        let swap_ctx = CpiContext::new(
+                            ctx.accounts.clmm_program.to_account_info(),
+                            swap_accounts,
+                        ).with_signer(signer_seeds);
+
+                        // is_base_input=false: 从 token1 -> token0
+                        cpi::swap_v2(
+                            swap_ctx,
+                            got1,                       // 全部换
+                            p.other_amount_threshold,   // e.g. 0
+                            p.sqrt_price_limit_x64,     // 0 表示默认不限制
+                            false,
+                        )?;
+                        // 刷新 USDC(token0) 余额增量
+                        let new_token0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
+                        total_usdc_after_swap = new_token0; // 由于 pre0 + got0 + swap_out 都在同一账户里，直接取最新余额更稳
+                    }
+                } else {
+                    // USDC 是 token1，需把 got0(=token0) 全部换成 token1
+                    total_usdc_after_swap = pre_usdc + got1;
+                    if got0 > 0 {
+                        let swap_accounts = cpi::accounts::SwapSingleV2 {
+                            payer:               ctx.accounts.operation_data.to_account_info(),
+                            amm_config:          ctx.accounts.amm_config.to_account_info(),
+                            pool_state:          ctx.accounts.pool_state.to_account_info(),
+                            input_token_account: ctx.accounts.input_token_account.to_account_info(),  // in: token0 (PDA)
+                            output_token_account:ctx.accounts.output_token_account.to_account_info(), // out: token1 (PDA/USDC)
+                            input_vault:         ctx.accounts.input_vault.to_account_info(),          // vault0
+                            output_vault:        ctx.accounts.output_vault.to_account_info(),         // vault1
+                            observation_state:   ctx.accounts.observation_state.to_account_info(),
+                            token_program:       ctx.accounts.token_program.to_account_info(),
+                            token_program_2022:  ctx.accounts.token_program_2022.to_account_info(),
+                            memo_program:        ctx.accounts.memo_program.to_account_info(),
+                            input_vault_mint:    ctx.accounts.input_vault_mint.to_account_info(),
+                            output_vault_mint:   ctx.accounts.output_vault_mint.to_account_info(),
+                        };
+                        let swap_ctx = CpiContext::new(
+                            ctx.accounts.clmm_program.to_account_info(),
+                            swap_accounts,
+                        ).with_signer(signer_seeds);
+
+                        // is_base_input=true: 从 token0 -> token1
+                        cpi::swap_v2(
+                            swap_ctx,
+                            got0,
+                            p.other_amount_threshold,
+                            p.sqrt_price_limit_x64,
+                            true,
+                        )?;
+                        let new_token1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
+                        total_usdc_after_swap = new_token1;
+                    }
+                }
+
+                // ---- 第三步：最低到手保护 + 转给收款人 USDC ATA ----
+                require!(total_usdc_after_swap >= p.min_usdc_out, OperationError::InvalidParams);
+
+                let (from_acc, _non_usdc_acc) = if usdc_mint == ctx.accounts.input_vault_mint.key() {
+                    (ctx.accounts.input_token_account.to_account_info(), ctx.accounts.output_token_account.to_account_info())
+                } else {
+                    (ctx.accounts.output_token_account.to_account_info(), ctx.accounts.input_token_account.to_account_info())
+                };
+
+                // 从 PDA 名下 USDC 账户 -> 用户的 USDC ATA（recipient_token_account）
+                let cpi_accounts = anchor_spl::token::Transfer {
+                    from:      from_acc,
+                    to:        ctx.accounts.recipient_token_account.to_account_info(),
+                    authority: ctx.accounts.operation_data.to_account_info(),
+                };
+                let token_ctx = CpiContext::new(
+                    ctx.accounts.token_program.to_account_info(),
+                    cpi_accounts
+                ).with_signer(signer_seeds);
+                anchor_spl::token::transfer(token_ctx, total_usdc_after_swap)?;
+
+
+            }
+
             OperationType::ZapOut => {
                 let p: ZapOutParams = deserialize_params(&action)?;
 
@@ -383,8 +572,8 @@ pub mod dg_solana_programs {
                 require!(ctx.accounts.recipient_token_account.mint == want_mint, OperationError::InvalidMint);
 
                 // 赎回前余额
-                let pre0 = get_token_balance(&ctx.accounts.input_token_account)?;
-                let pre1 = get_token_balance(&ctx.accounts.output_token_account)?;
+                let pre0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
+                let pre1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
 
                 // 流动性与 tick 信息读取（不带出引用）
                 let full_liquidity: u128 = ctx.accounts.personal_position.liquidity;
@@ -464,8 +653,8 @@ pub mod dg_solana_programs {
                 }
 
                 // 实际到账
-                let post0 = get_token_balance(&ctx.accounts.input_token_account)?;
-                let post1 = get_token_balance(&ctx.accounts.output_token_account)?;
+                let post0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
+                let post1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
                 let got0 = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
                 let got1 = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
 
@@ -538,10 +727,10 @@ pub mod dg_solana_programs {
 
                     // 刷新单边后的总量
                     if p.want_base {
-                        let new_base = get_token_balance(&ctx.accounts.input_token_account)?;
+                        let new_base = get_token_balance(&mut ctx.accounts.input_token_account)?;
                         total_out = new_base.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
                     } else {
-                        let new_quote = get_token_balance(&ctx.accounts.output_token_account)?;
+                        let new_quote = get_token_balance(&mut ctx.accounts.output_token_account)?;
                         total_out = new_quote.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
                     }
                 }
@@ -673,7 +862,8 @@ fn apply_slippage_min(estimate: u64, bps: u32) -> u64 {
     (num / 10_000u128) as u64
 }
 
-fn get_token_balance(acc: &InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
+fn get_token_balance(acc: &mut InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
+    acc.reload()?; // Fetch the latest on-chain data
     Ok(acc.amount)
 }
 
@@ -884,6 +1074,7 @@ pub struct OperationData {
     pub action: Vec<u8>, // Serialize operation-specific parameters
     pub amount: u64,
     pub executed: bool,
+    pub ca: Pubkey, // contract address
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
@@ -891,6 +1082,14 @@ pub enum OperationType {
     Transfer,
     ZapIn,
     ZapOut,
+    Claim
+}
+#[derive(AnchorSerialize, AnchorDeserialize)]
+pub struct ClaimParams {
+    // 期望把所有手续费都换成 USDC 并打到 `recipient_token_account`。
+    pub min_usdc_out: u64, // 汇总到手的USDC 最低保护
+    pub other_amount_threshold: u64, // 给 swap_v2 的另一侧最小值（滑点保护），一般给 0
+    pub sqrt_price_limit_x64: u128,  // swap 价格限制（不想限制就给 0）
 }
 
 impl Default for OperationType {
@@ -938,7 +1137,9 @@ impl OperationData {
             1 +  // operation_type (enum discriminator)
             4 + 128 + // action vec<u8> (prefix + max size)
             8 +  // amount
-            1;   // executed
+            1 +    // executed
+            32;  // CA
+
 }
 
 #[error_code]
