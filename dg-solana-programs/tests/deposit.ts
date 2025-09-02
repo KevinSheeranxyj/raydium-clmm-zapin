@@ -1,39 +1,12 @@
 import * as anchor from "@coral-xyz/anchor";
-import {Program, Wallet} from "@coral-xyz/anchor";
+import { Program } from "@coral-xyz/anchor";
+import { PublicKey, Keypair, SystemProgram } from "@solana/web3.js";
+import { assert } from "chai";
 import * as web3 from "@solana/web3.js";
-import {
-    createAccount,
-    createMint, createTransferInstruction,
-    getOrCreateAssociatedTokenAccount,
-    mintTo,
-    TOKEN_PROGRAM_ID
-} from "@solana/spl-token";
-import {Keypair, PublicKey} from "@solana/web3.js";
-import * as fs from "node:fs";
-import * as path from "node:path";
+import path from "node:path";
 import {fileURLToPath} from "node:url";
-
-
-const program = anchor.workspace.dgSolanaPrograms as Program<DgSolanaPrograms>;
-
-const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
-
-
-let mint: PublicKey;
-let userTokenAccount: PublicKey;
-let recipientTokenAccount: PublicKey;
-let adminTokenAccount: PublicKey;
-let transferDataPda: PublicKey;
-let authority: Wallet;
-let bump: number;
-let admin = loadKeypair("keys/admin.json");;
-
-
-
-const isoTimestamp = new Date().toISOString();
-const transferId = "t" + isoTimestamp;
-const amount = 1_000_000; // 1 token with 6 decimals
-let recipient: Keypair;
+import fs from "node:fs";
+import BN from "bn.js";
 
 function loadKeypair(filePath: string): web3.Keypair {
     const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -41,87 +14,181 @@ function loadKeypair(filePath: string): web3.Keypair {
     const secretKey = Uint8Array.from(JSON.parse(fs.readFileSync(absolutePath, "utf8")));
     return web3.Keypair.fromSecretKey(secretKey);
 }
+let admin = loadKeypair("keys/admin.json");
 
-async function prepare() {
-    // Load keypairs from local files
-    admin = loadKeypair("keys/admin.json");
-    console.log("Admin PubKey:", admin.publicKey.toBase58());
+describe("dg_solana_programs - Deposit Instruction", () => {
+    // Configure the client to use the mainnet cluster
+    let connection = new web3.Connection("https://warmhearted-delicate-uranium.solana-mainnet.quiknode.pro/300dfad121b027e64f41fc3b31d342d4b38ed5be", 'confirmed')
+    const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(admin), {
+        commitment: 'confirmed'
+    })
+    anchor.setProvider(provider);
+    const program = anchor.workspace.DgSolanaPrograms as Program<DgSolanaPrograms>;
 
-    recipient = loadKeypair("keys/recipient.json");
-    console.log("Recipient Pubkey:", recipient.publicKey.toBase58());
-}
+    // Constants for public keys
+    const USDC_MINT = new PublicKey("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v");
+    const RECIPIENT_PUBKEY = new PublicKey("DY9taff8ydRpFMfbC3woPFLwA6t1VtMGzjmpr5LjvwW4");
 
+    // Generate a keypair for the authority
+    const authority = admin;
+    let transferDataPda: PublicKey;
+    let bump: number;
 
-describe("dg-solana-programs", () => {
-    before(async() => {
+    // Test data
+    const transferId = "test-transfer-123";
+    const amount = new BN(1_000_000); // 1 USDC (assuming 6 decimals)
 
-        await prepare();
-
-        let connection = new web3.Connection("https://solana-devnet.api.syndica.io/api-key/3BrTAJSHwjMSUC3WxMHx72VSqUKrBJFciFbEd2RfabjZJ6F9LNhBdqQq3PkJxd2C9rKf5zBG1UNjf7NywRw1utuQwzMktZt1bSd", 'confirmed')
-        const provider = new anchor.AnchorProvider(connection, new anchor.Wallet(admin), {
-            commitment: 'confirmed'
-        })
-        anchor.setProvider(provider);
-        authority = provider.wallet; // admin account
-
-        // Check admin balance
-        const balance = await provider.connection.getBalance(admin.publicKey);
-        console.log(`Admin balance: ${balance / web3.LAMPORTS_PER_SOL} SOL`);
-        if (balance < web3.LAMPORTS_PER_SOL * 0.01) {
-            throw new Error("Insufficient balance in admin account. Please fund it with SOL.");
-        }
-        console.log("ProgramID: ", program.programId.toBase58());
-        console.log("Authority: ", authority.publicKey.toBase58());
-        // ATAs for USDC
-        const adminAta = await getOrCreateAssociatedTokenAccount(
-            provider.connection,
-            authority.payer,
-            USDC_MINT,
-            authority.publicKey,
-        );
-        adminTokenAccount = adminAta.address;
-        console.log("Admin USDC ATA:", adminTokenAccount.toBase58());
-
-        const recipientAta = await getOrCreateAssociatedTokenAccount(
-            provider.connection,
-            authority.payer,
-            USDC_MINT,
-            recipient.publicKey
-        );
-        recipientTokenAccount = recipientAta.address;
-        console.log("Recipient USDC ATA:", recipientTokenAccount.toBase58());
-
-        const tx = new web3.Transaction().add(
-            createTransferInstruction(
-                adminTokenAccount,
-                recipientTokenAccount,
-                authority.publicKey, // admin is the ATA owner
-                amount,
-                [],
-                TOKEN_PROGRAM_ID
-            )
-        );
-        const sig = await provider.sendAndConfirm(tx, []);
-        console.log("USDC transfer sig:", sig);
-
-        // Find PDA
-        [transferDataPda, bump] = await PublicKey.findProgramAddress(
+    // Helper to find PDA
+    const getTransferDataPda = async () => {
+        const [pda, pdaBump] = await PublicKey.findProgramAddress(
             [Buffer.from("transfer_data")],
             program.programId
         );
-        console.log("transferDataPDA: {}", transferDataPda.toBase58());
+        return { pda, bump: pdaBump };
+    };
+
+    before(async () => {
+        // Set provider with authority wallet
+        const customProvider = new anchor.AnchorProvider(
+            provider.connection,
+            new anchor.Wallet(authority),
+            { commitment: "confirmed" }
+        );
+        anchor.setProvider(customProvider);
+
+        // Airdrop SOL to authority (for devnet/testnet; for mainnet, ensure account is funded)
+        try {
+            const signature = await provider.connection.requestAirdrop(
+                authority.publicKey,
+                2 * anchor.web3.LAMPORTS_PER_SOL
+            );
+            await provider.connection.confirmTransaction(signature);
+        } catch (err) {
+            console.warn("Airdrop failed; ensure authority account is funded on mainnet:", err);
+        }
+
+        // Find PDA
+        const { pda, bump: pdaBump } = await getTransferDataPda();
+        transferDataPda = pda;
+        bump = pdaBump;
+        console.log("Transfer Data PDA:", transferDataPda.toBase58());
+
+        // Initialize the PDA
+        await program.methods
+            .initialize()
+            .accounts({
+                transferData: transferDataPda,
+                authority: authority.publicKey,
+                systemProgram: SystemProgram.programId,
+            })
+            .signers([authority])
+            .rpc();
+
+        // Verify initialization
+        const transferDataAccount = await program.account.transferData.fetch(transferDataPda);
+        assert.equal(
+            transferDataAccount.authority.toBase58(),
+            authority.publicKey.toBase58(),
+            "Authority mismatch after initialization"
+        );
+        assert.isTrue(transferDataAccount.initialized, "PDA should be initialized");
     });
 
-
-    it("Deposit transfer details", async () => {
-
+    it("Deposits transfer details successfully", async () => {
+        // Execute deposit
         await program.methods
-            .deposit(transferId, new anchor.BN(amount), recipient.publicKey)
+            .deposit(transferId, amount, RECIPIENT_PUBKEY)
             .accounts({
                 transferData: transferDataPda,
                 authority: authority.publicKey,
             })
+            .signers([authority])
             .rpc();
 
+        // Verify transfer data
+        const transferDataAccount = await program.account.transferData.fetch(transferDataPda);
+        assert.equal(transferDataAccount.transferId, transferId, "Transfer ID should match");
+        assert.equal(transferDataAccount.amount.toNumber(), amount.toNumber(), "Amount should match");
+        assert.equal(
+            transferDataAccount.recipient.toBase58(),
+            RECIPIENT_PUBKEY.toBase58(),
+            "Recipient should match"
+        );
+        assert.isFalse(transferDataAccount.executed, "Transfer should not be executed");
+        assert.equal(
+            transferDataAccount.authority.toBase58(),
+            authority.publicKey.toBase58(),
+            "Authority should remain unchanged"
+        );
     });
-})
+
+    it("Fails to deposit with unauthorized authority", async () => {
+        // Create a new keypair to simulate an unauthorized authority
+        const unauthorizedAuthority = Keypair.generate();
+
+        try {
+            await program.methods
+                .deposit(transferId + "-2", amount, RECIPIENT_PUBKEY)
+                .accounts({
+                    transferData: transferDataPda,
+                    authority: unauthorizedAuthority.publicKey,
+                })
+                .signers([unauthorizedAuthority])
+                .rpc();
+            assert.fail("Should have failed with Unauthorized error");
+        } catch (err) {
+            assert.include(err.toString(), "Unauthorized", "Should fail with Unauthorized error");
+        }
+    });
+
+    it("Fails to deposit with invalid transfer ID (empty)", async () => {
+        try {
+            await program.methods
+                .deposit("", amount, RECIPIENT_PUBKEY)
+                .accounts({
+                    transferData: transferDataPda,
+                    authority: authority.publicKey,
+                })
+                .signers([authority])
+                .rpc();
+            assert.fail("Should have failed with InvalidTransferId error");
+        } catch (err) {
+            assert.include(err.toString(), "InvalidTransferId", "Should fail with InvalidTransferId error");
+        }
+    });
+
+    it("Fails to deposit with invalid amount (zero)", async () => {
+        try {
+            await program.methods
+                .deposit(transferId + "-3", new BN(0), RECIPIENT_PUBKEY)
+                .accounts({
+                    transferData: transferDataPda,
+                    authority: authority.publicKey,
+                })
+                .signers([authority])
+                .rpc();
+            assert.fail("Should have failed with InvalidAmount error");
+        } catch (err) {
+            assert.include(err.toString(), "InvalidAmount", "Should fail with InvalidAmount error");
+        }
+    });
+
+    it("Fails to deposit with oversized transfer ID", async () => {
+        // Create a transfer ID longer than MAX_TRANSFER_ID_LEN (32 bytes)
+        const oversizedTransferId = "a".repeat(33);
+
+        try {
+            await program.methods
+                .deposit(oversizedTransferId, amount, RECIPIENT_PUBKEY)
+                .accounts({
+                    transferData: transferDataPda,
+                    authority: authority.publicKey,
+                })
+                .signers([authority])
+                .rpc();
+            assert.fail("Should have failed with InvalidTransferId error");
+        } catch (err) {
+            assert.include(err.toString(), "InvalidTransferId", "Should fail with InvalidTransferId egressor");
+        }
+    });
+});
