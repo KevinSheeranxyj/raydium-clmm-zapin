@@ -6,7 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-dg_solana_programs = "2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A"
+dg_solana_zapin = "2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A"
 
 [registry]
 url = "https://api.apr.dev"

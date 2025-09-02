@@ -20,7 +20,7 @@ declare_id!("2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A");
 
 /// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
 #[program]
-pub mod dg_solana_programs {
+pub mod dg_solana_zapin {
     use super::*;
 
     pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
