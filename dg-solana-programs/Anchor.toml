@@ -5,17 +5,14 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 
-#[programs.localnet]
-#dg_solana_programs = "DxzbvkdnQhXGmEz732meAeF9TS8qLit7SAcpa6JXnB6P"
-
 [programs.devnet]
-dg_solana_programs = "j3q33yPf3b74tKkXepzcK5oZ45ULgCUpAjtxXWfUF1z"
+dg_solana_programs = "2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "mainnet" ## Use mainnet for test purpose
+cluster = "mainnet"
 wallet = "~/.config/solana/admin.json"
 
 [scripts]
