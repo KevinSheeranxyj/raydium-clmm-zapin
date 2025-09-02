@@ -83,9 +83,6 @@ pub mod dg_solana_programs {
         if let OperationType::ZapIn = operation_type {
             let _p: ZapInParams = deserialize_params(&operation_data.action)?;
         }
-        if let OperationType::ZapOut = operation_type {
-            let _p: ZapOutParams = deserialize_params(&operation_data.action)?;
-        }
 
         msg!(
             "Deposited transfer details: ID={}, Amount={}, Recipient={}",
@@ -122,7 +119,7 @@ pub mod dg_solana_programs {
 
         let token_program = ctx.accounts.token_program.to_account_info();
 
-        // ----------------------------- ZapIn 开始 -----------------------------
+        // ----------------------------- ZapIn start -----------------------------
         let p: ZapInParams = deserialize_params(&action)?;
         require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
 
@@ -498,11 +495,6 @@ fn tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
     q * span
 }
 
-#[inline]
-fn apply_slippage_min(estimate: u64, bps: u32) -> u64 {
-    let num = (estimate as u128) * (10_000u128 - bps as u128);
-    (num / 10_000u128) as u64
-}
 
 fn get_token_balance(acc: &mut InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
     acc.reload()?; // Fetch the latest on-chain data
