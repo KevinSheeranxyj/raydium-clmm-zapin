@@ -12,26 +12,38 @@
   },
   "dev": {
     "namespace": "dev-backend",
-    "consulPrefix": "DEV"
+    "consulPrefix": "DEV",
+    "efsHost": "/efs",
+    "efsEnvPrefix": "/dev"
   },
   "testd": {
     "namespace": "testd-be",
-    "consulPrefix": "testd"
+    "consulPrefix": "testd",
+    "efsHost": "/efs",
+    "efsEnvPrefix": "/testd"
   },
   "teste": {
     "namespace": "teste-be",
-    "consulPrefix": "teste"
+    "consulPrefix": "teste",
+    "efsHost": "/efs",
+    "efsEnvPrefix": "/teste"
   },
   "testf": {
     "namespace": "testf-be",
-    "consulPrefix": "testf"
+    "consulPrefix": "testf",
+    "efsHost": "/efs",
+    "efsEnvPrefix": "/testf"
   },
   "staging": {
     "namespace": "backend-be",
-    "consulPrefix": "STG"
+    "consulPrefix": "STG",
+    "efsHost": "/efs",
+    "efsEnvPrefix": "/backend"
   },
   "production": {
     "namespace": "backend-be",
-    "consulPrefix": "PRD"
+    "consulPrefix": "PRD",
+    "efsHost": "/efs",
+    "efsEnvPrefix": "/backend"
   }
 }

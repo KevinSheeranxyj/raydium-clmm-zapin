@@ -1,4 +1,4 @@
-# dg-solana-programs
+# dg-solana-zap-in
 
 
 
@@ -15,14 +15,14 @@ Already a pro? Just edit this README.md and make it your own. Want to make it ea
 
 ```
 cd existing_repo
-git remote add origin http://gitlab.bihutest.com/dg/dg-solana-programs.git
+git remote add origin http://gitlab.bihutest.com/dg/dg-solana-zap-in.git
 git branch -M main
 git push -uf origin main
 ```
 
 ## Integrate with your tools
 
-- [ ] [Set up project integrations](http://gitlab.bihutest.com/dg/dg-solana-programs/-/settings/integrations)
+- [ ] [Set up project integrations](http://gitlab.bihutest.com/dg/dg-solana-zap-in/-/settings/integrations)
 
 ## Collaborate with your team
 
