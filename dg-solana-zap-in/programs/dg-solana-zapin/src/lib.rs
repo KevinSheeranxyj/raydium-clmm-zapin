@@ -768,7 +768,7 @@ impl OperationData {
             4 + 64 + // transfer_id (prefix + max size)
             32 + // recipient pubkey
             1 +  // operation_type (enum discriminator)
-            4 + 128 + // action vec<u8> (prefix + max size)
+            4 + 256 + // action vec<u8> (prefix + max size)
             8 +  // amount
             1 +    // executed
             32;  // CA
