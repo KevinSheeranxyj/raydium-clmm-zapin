@@ -8,10 +8,10 @@
       <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/src/lib/src" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/dg-solana-programs/tests" isTestSource="true" />
-      <sourceFolder url="file://$MODULE_DIR$/dg-solana-zap-in/programs/dg-solana-programs/src" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/dg-solana-zap-in/programs/dg-solana-zapin/src" isTestSource="false" />
       <excludeFolder url="file://$MODULE_DIR$/dg-solana-programs/src/lib/target" />
       <excludeFolder url="file://$MODULE_DIR$/dg-solana-programs/target" />
-      <excludeFolder url="file://$MODULE_DIR$/dg-solana-zap-in/programs/dg-solana-programs/target" />
+      <excludeFolder url="file://$MODULE_DIR$/dg-solana-zap-in/programs/dg-solana-zapin/target" />
     </content>
     <orderEntry type="inheritedJdk" />
     <orderEntry type="sourceFolder" forTests="false" />
