@@ -123,8 +123,7 @@ pub mod dg_solana_zapin {
         let p: ZapInParams = deserialize_params(&action)?;
         require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
 
-        // 检查 pool 的 token_a 是否等于 CA（业务约束）
-        require!(p.token_a_mint == ca, OperationError::InvalidMint);
+        require!(ca == ctx.accounts.input_vault_mint.key(), OperationError::InvalidMint);
 
         // --- 如果用户实际存入 amount < 期望 p.amount_in，则全额原路退回到 recipient_token_account ---
         if amount < p.amount_in {
@@ -161,6 +160,52 @@ pub mod dg_solana_zapin {
             let pool = ctx.accounts.pool_state.load()?; // Ref<PoolState>
             pool.sqrt_price_x64
         };
+
+        // 将 sqrt 价转为价格 P = (sp^2) / Q64
+        let sp_u = U256::from(sp);
+        let q64_u = U256::from(Q64_U128);
+        let price_q64 = sp_u.mul_div_floor(sp_u, q64_u).ok_or(error!(OperationError::InvalidParams))?;
+        // 注意：price_q64 也是 Q64.64 定点
+        // 交易方向
+        let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
+
+        let amount_in_u = U256::from(p.amount_in);
+
+        // ---- 读取手续费（若有）并做折扣 ----
+        let cfg = ctx.accounts.amm_config.as_ref(); // Box<Account<AmmConfig>>
+        let trade_fee_bps: u32 = cfg.trade_fee_rate.into();           // 例：30 (0.3%)
+        let protocol_fee_bps: u32 = cfg.protocol_fee_rate.into();     // 例：5  (0.05%)，具体以 Raydium 定义为准
+        let total_fee_bps: u32 = trade_fee_bps + protocol_fee_bps;
+
+        // user 滑点（正整数 bps）
+        let slip_bps = if p.slippage_bps < 0 { 0 } else { p.slippage_bps as u32 };
+
+        // 综合折扣系数 D = (1 - fee_bps/1e4) * (1 - slip_bps/1e4)
+        let one = U256::from(10_000u32);
+        let fee_factor = one - U256::from(total_fee_bps);
+        let slip_factor = one - U256::from(slip_bps);
+        let discount = fee_factor.mul_div_floor(slip_factor, one).ok_or(error!(OperationError::InvalidParams))?; // /1e4
+
+        // 计算“理想输出”（忽略价格冲击），再乘以折扣
+        let mut min_amount_out_u = if is_base_input {
+            // token0 -> token1: out ≈ in * P
+            // amount_out(Q0) = amount_in * price_q64 / Q64
+            // 先算理想，再乘 discount，再 /1e4
+            let ideal = amount_in_u
+                .mul_div_floor(price_q64, q64_u)
+                .ok_or(error!(OperationError::InvalidParams))?;
+            ideal.mul_div_floor(discount, one).ok_or(error!(OperationError::InvalidParams))?
+        } else {
+            // token1 -> token0: out ≈ in / P
+            // amount_out(Q1) = amount_in * Q64 / price_q64
+            let ideal = amount_in_u
+                .mul_div_floor(q64_u, price_q64.max(U256::from(1u8))) // 防 0
+                .ok_or(error!(OperationError::InvalidParams))?;
+            ideal.mul_div_floor(discount, one).ok_or(error!(OperationError::InvalidParams))?
+        };
+
+        // 转 u64，保护下界
+        let min_amount_out = min_amount_out_u.to_underflow_u64();
 
         // 1) 计算区间端点的 sqrt 价格
         let sa = tick_math::get_sqrt_price_at_tick(p.tick_lower)
@@ -251,12 +296,10 @@ pub mod dg_solana_zapin {
                 input_vault_mint: in_mint,
                 output_vault_mint: out_mint,
             };
-
-            let other_amount_threshold = if is_base_input {
-                p.min_amount_out
-            } else {
-                p.other_amount_threshold
-            };
+            let other_amount_threshold = min_amount_out;
+            // 可选：如果你想限制价格滑动方向，给 sqrt_price_limit_x64 一个保守的上下限；
+            // 否则传 0 表示不限制（以 Raydium 当前实现为准）
+            let sqrt_price_limit_x64: u128 = 0;
 
             let swap_ctx = CpiContext::new(clmm, swap_accounts)
                 .with_signer(signer_seeds);
@@ -265,7 +308,7 @@ pub mod dg_solana_zapin {
                 swap_ctx,
                 swap_amount,
                 other_amount_threshold,
-                p.sqrt_price_limit_x64,
+                sqrt_price_limit_x64,
                 is_base_input,
             )?;
         }
@@ -714,15 +757,6 @@ pub struct OperationData {
 pub enum OperationType {
     Transfer,
     ZapIn,
-    ZapOut,
-    Claim
-}
-#[derive(AnchorSerialize, AnchorDeserialize)]
-pub struct ClaimParams {
-    // 期望把所有手续费都换成 USDC 并打到 `recipient_token_account`。
-    pub min_usdc_out: u64, // 汇总到手的USDC 最低保护
-    pub other_amount_threshold: u64, // 给 swap_v2 的另一侧最小值（滑点保护），一般给 0
-    pub sqrt_price_limit_x64: u128,  // swap 价格限制（不想限制就给 0）
 }
 
 impl Default for OperationType {
@@ -739,26 +773,11 @@ pub struct TransferParams {
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ZapInParams {
-    pub amount_in: u64,
-    pub min_amount_out: u64,
-    pub pool: Pubkey,
-    pub token_a_mint: Pubkey,
-    pub token_b_mint: Pubkey,
-    pub tick_lower: i32,
-    pub tick_upper: i32,
-    pub sqrt_price_limit_x64: u128,
-    pub other_amount_threshold: u64,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
-pub struct ZapOutParams {
-    pub want_base: bool,
-    pub min_payout: u64,
-    pub sqrt_price_limit_x64: u128,
-    pub other_amount_threshold: u64,
-    pub recipient: Pubkey,
-    pub liquidity_to_burn_u64: u64,
-    pub slippage_bps: u32,
+    pub amount_in: u64, // required
+    pub pool: Pubkey, // required
+    pub tick_lower: i32, // required
+    pub tick_upper: i32, // required
+    pub slippage_bps: i32, // required
 }
 
 impl OperationData {
