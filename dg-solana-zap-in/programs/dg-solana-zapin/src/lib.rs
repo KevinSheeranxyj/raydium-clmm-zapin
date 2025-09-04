@@ -15,8 +15,14 @@ use raydium_amm_v3::{
     program::AmmV3,
     states::{PoolState, AmmConfig, POSITION_SEED, TICK_ARRAY_SEED, ObservationState, TickArrayState, ProtocolPositionState, PersonalPositionState},
 };
+use anchor_lang::solana_program::{
+    program::invoke_signed,
+    program_pack::Pack,
+    system_instruction,
+};
+use anchor_spl::token::spl_token;
 
-declare_id!("2f7mzs8Hqra1L6aLCEdoR4inNtNBFmNgsiuJMr8q2x7A");
+declare_id!("9T7YMp5SXZvP3nqUj9B7rQGFErfMmh8t59jvxtV3CnjB");
 
 /// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
 #[program]
@@ -52,6 +58,13 @@ pub mod dg_solana_zapin {
         ca: Pubkey,
     ) -> Result<()> {
         let operation_data = &mut ctx.accounts.operation_data;
+
+        msg!("op_type = {:?}", operation_type);
+        msg!("action.len() = {}", action.len());
+        if action.len() > 0 {
+            let preview = &action[..core::cmp::min(16, action.len())];
+            msg!("action[0..] = {:?}", preview);
+        }
 
         // Verify transfer params
         require!(operation_data.initialized, OperationError::NotInitialized);
@@ -100,7 +113,7 @@ pub mod dg_solana_zapin {
 
     // Execute the token transfer
     // Execute the token transfer (ZapIn only)
-    pub fn execute(ctx: Context<Execute>) -> Result<()> {
+    pub fn execute(ctx: Context<Execute>, bounds: PositionBounds) -> Result<()> {
         require!(ctx.accounts.operation_data.initialized, OperationError::NotInitialized);
         require!(!ctx.accounts.operation_data.executed, OperationError::AlreadyExecuted);
         require!(ctx.accounts.operation_data.amount > 0, OperationError::InvalidAmount);
@@ -319,6 +332,47 @@ pub mod dg_solana_zapin {
         let received = post_out.checked_sub(pre_out).ok_or(error!(OperationError::InvalidParams))?;
         let spent    = pre_in.checked_sub(post_in).ok_or(error!(OperationError::InvalidParams))?;
         let remaining = amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
+
+        {
+            let mint_info = &ctx.accounts.position_nft_mint.to_account_info();
+            if mint_info.data_is_empty() {
+                let mint_space = spl_token::state::Mint::LEN;
+                let rent_lamports = Rent::get()?.minimum_balance(mint_space);
+
+                let create_ix = system_instruction::create_account(
+                    &ctx.accounts.user.key(),                 // 付款人
+                    &ctx.accounts.position_nft_mint.key(),    // 要创建的 mint（PDA）
+                    rent_lamports,
+                    mint_space as u64,
+                    &ctx.accounts.token_program.key(),        // owner = SPL Token Program
+                );
+
+                // 关键：把会临时生成的 key 先保存到局部变量，延长生命周期
+                let user_key: Pubkey = ctx.accounts.user.key();
+                let pool_key: Pubkey = ctx.accounts.pool_state.key();
+                let bump: u8 = ctx.bumps.position_nft_mint;
+                let bump_bytes: [u8; 1] = [bump];
+
+                let pos_mint_seeds: &[&[u8]] = &[
+                    b"pos_nft_mint",
+                    user_key.as_ref(),        // <-- 引用局部变量，生命周期足够长
+                    pool_key.as_ref(),        // <-- 同上
+                    &bump_bytes,              // <-- 避免 &[bump] 的临时数组
+                ];
+
+                invoke_signed(
+                    &create_ix,
+                    &[
+                        ctx.accounts.user.to_account_info(),
+                        mint_info.clone(),
+                        ctx.accounts.system_program.to_account_info(),
+                    ],
+                    &[pos_mint_seeds],
+                )?;
+            }
+            // 此时：position_nft_mint 是“已创建但未初始化”的 SPL-Token Mint 账号
+            // 后续交给 Raydium 的 open_position_v2 去 Initialize & Mint 到 position_nft_account
+        }
 
         // 5) 开仓（铸造仓位 NFT）
         {
@@ -636,11 +690,16 @@ pub struct Execute<'info> {
     )]
     pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
-    // --- 仓位 NFT ---
+    /// CHECK: position_nft_mint
+    #[account(
+        mut,
+        seeds = [b"pos_nft_mint", user.key().as_ref(), pool_state.key().as_ref()],
+        bump
+    )]
+    pub position_nft_mint: UncheckedAccount<'info>,
+    /// CHECK: position_nft_account
     #[account(mut)]
-    pub position_nft_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(mut)]
-    pub position_nft_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+    pub position_nft_account: UncheckedAccount<'info>,
 
     // --- Raydium 池 & 配置 ---
     #[account(address = pool_state.load()?.amm_config)]
@@ -777,7 +836,7 @@ pub struct ZapInParams {
     pub pool: Pubkey, // required
     pub tick_lower: i32, // required
     pub tick_upper: i32, // required
-    pub slippage_bps: i32, // required
+    pub slippage_bps: u32, // required
 }
 
 impl OperationData {
