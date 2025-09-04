@@ -15,6 +15,7 @@ use raydium_amm_v3::{
     program::AmmV3,
     states::{PoolState, AmmConfig, POSITION_SEED, TICK_ARRAY_SEED, ObservationState, TickArrayState, ProtocolPositionState, PersonalPositionState},
 };
+use anchor_lang::solana_program::hash::hash as solana_hash;
 use anchor_lang::solana_program::{
     program::invoke_signed,
     program_pack::Pack,
@@ -113,30 +114,66 @@ pub mod dg_solana_zapin {
 
     // Execute the token transfer
     // Execute the token transfer (ZapIn only)
-    pub fn execute(ctx: Context<Execute>, bounds: PositionBounds) -> Result<()> {
-        require!(ctx.accounts.operation_data.initialized, OperationError::NotInitialized);
-        require!(!ctx.accounts.operation_data.executed, OperationError::AlreadyExecuted);
-        require!(ctx.accounts.operation_data.amount > 0, OperationError::InvalidAmount);
+    pub fn execute(ctx: Context<Execute>, transfer_id: String) -> Result<()> {
+        let od = &mut ctx.accounts.operation_data;
 
-        let amount = ctx.accounts.operation_data.amount;
-        let op_type = ctx.accounts.operation_data.operation_type.clone();
-        let action  = ctx.accounts.operation_data.action.clone();
-        let ca = ctx.accounts.operation_data.ca;
+        // 基础校验
+        require!(od.initialized, OperationError::NotInitialized);
+        require!(!od.executed, OperationError::AlreadyExecuted);
+        require!(od.amount > 0, OperationError::InvalidAmount);
+        require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
+        require!(matches!(od.operation_type, OperationType::ZapIn), OperationError::InvalidParams);
 
-        // 只允许 ZapIn
-        require!(matches!(op_type, OperationType::ZapIn), OperationError::InvalidParams);
+        let amount = od.amount;
+        let ca = od.ca;
 
+        // signer seeds：按 transfer_id
         let bump = ctx.bumps.operation_data;
-        let seeds: &[&[u8]] = &[b"operation_data", &[bump]];
-        let signer_seeds: &[&[&[u8]]] = &[seeds];
+        let h = transfer_id_hash_bytes(&transfer_id);
+        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data", &h, &[bump]];
+        let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
 
-        let token_program = ctx.accounts.token_program.to_account_info();
-
-        // ----------------------------- ZapIn start -----------------------------
-        let p: ZapInParams = deserialize_params(&action)?;
+        // 从 OperationData.action 反序列化出 ZapInParams
+        let p: ZapInParams = deserialize_params(&od.action)?;
         require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
 
-        require!(ca == ctx.accounts.input_vault_mint.key(), OperationError::InvalidMint);
+        let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
+        // 下面基本沿用你原 execute 里的逻辑：
+        // - 校验 ca 与 input_vault_mint
+        // - 处理“实际 < 期望”时全额退款
+        // - 计算价格、滑点、分配比例、swap、open_position_v2、increase_liquidity_v2 等
+        // - 期间把原来依赖 bounds 的地方，改成使用 p.tick_lower / p.tick_upper
+        // - 对 protocol_position / tick_array_* 做运行时派生与 require! 一致性校验
+
+        require!(ca == ctx.accounts.input_vault_mint.key() || ca == ctx.accounts.output_vault_mint.key(), OperationError::InvalidMint);
+        // 例：运行时派生 protocol_position PDA 并校验
+        let pool = ctx.accounts.pool_state.load()?;
+        let tick_spacing: i32 = pool.tick_spacing.into();
+        let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
+        let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
+
+        {
+            let ta_lower = ctx.accounts.tick_array_lower.load()?;
+            let ta_upper = ctx.accounts.tick_array_upper.load()?;
+            require!(ta_lower.start_tick_index == lower_start, OperationError::InvalidParams);
+            require!(ta_upper.start_tick_index == upper_start, OperationError::InvalidParams);
+        }
+
+        // 按 Raydium v3 的 POSITION_SEED 规则派生出应有的 protocol_position 地址并核对
+        let pool_key: Pubkey = ctx.accounts.pool_state.key();
+        let lower_bytes = lower_start.to_be_bytes();
+        let upper_bytes = upper_start.to_be_bytes();
+        let proto_seeds: [&[u8]; 4] = [
+            POSITION_SEED.as_bytes(),
+            pool_key.as_ref(),
+            &lower_bytes,
+            &upper_bytes,
+        ];
+        let clmm_pid: Pubkey = ctx.accounts.clmm_program.key();
+        let (derived_pp, _) = Pubkey::find_program_address(&proto_seeds, &clmm_pid);
+        require!(ctx.accounts.protocol_position.key() == derived_pp, OperationError::InvalidParams);
+
+        // ----------------------------- ZapIn start -----------------------------
 
         // --- 如果用户实际存入 amount < 期望 p.amount_in，则全额原路退回到 recipient_token_account ---
         if amount < p.amount_in {
@@ -145,12 +182,14 @@ pub mod dg_solana_zapin {
             ctx.accounts.recipient_token_account.mint == ctx.accounts.program_token_account.mint,
             OperationError::InvalidMint
         );
+            let token_program = ctx.accounts.token_program.to_account_info();
 
             let refund_accounts = Transfer {
                 from: ctx.accounts.program_token_account.to_account_info(),
                 to: ctx.accounts.recipient_token_account.to_account_info(),
                 authority: ctx.accounts.operation_data.to_account_info()
             };
+
             token::transfer(
                 CpiContext::new_with_signer(
                     token_program,
@@ -162,10 +201,10 @@ pub mod dg_solana_zapin {
 
             ctx.accounts.operation_data.executed = true;
             msg!(
-            "ZapIn refund: expected amount_in = {}, received_amount = {}, refund all to recipient",
-            p.amount_in,
-            amount
-        );
+                "ZapIn refund: expected amount_in = {}, received_amount = {}, refund all to recipient",
+                p.amount_in,
+                amount
+            );
             return Ok(());
         }
 
@@ -179,8 +218,6 @@ pub mod dg_solana_zapin {
         let q64_u = U256::from(Q64_U128);
         let price_q64 = sp_u.mul_div_floor(sp_u, q64_u).ok_or(error!(OperationError::InvalidParams))?;
         // 注意：price_q64 也是 Q64.64 定点
-        // 交易方向
-        let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
 
         let amount_in_u = U256::from(p.amount_in);
 
@@ -191,7 +228,7 @@ pub mod dg_solana_zapin {
         let total_fee_bps: u32 = trade_fee_bps + protocol_fee_bps;
 
         // user 滑点（正整数 bps）
-        let slip_bps = if p.slippage_bps < 0 { 0 } else { p.slippage_bps as u32 };
+        let slip_bps = p.slippage_bps.min(10_000);
 
         // 综合折扣系数 D = (1 - fee_bps/1e4) * (1 - slip_bps/1e4)
         let one = U256::from(10_000u32);
@@ -243,7 +280,6 @@ pub mod dg_solana_zapin {
         let frac_den = r_den + r_num;
         require!(frac_den > U256::from(0u8), OperationError::InvalidParams);
 
-        let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
         let amount_in = p.amount_in;
 
         let amount_in_u256 = U256::from(amount_in); // 用户输入
@@ -519,14 +555,26 @@ pub mod dg_solana_zapin {
     }
 
 
-    pub fn claim(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
-        require!(ctx.accounts.operation_data.initialized, OperationError::NotInitialized);
-        // ⚠️ 是否“一次性执行”随你业务决定；通常 claim 应可多次执行
-        // require!(!ctx.accounts.operation_data.executed, OperationError::AlreadyExecuted);
-
+    pub fn claim(ctx: Context<Claim>, transfer_id: String, p: ClaimParams) -> Result<()> {
+        let od = &ctx.accounts.operation_data;
+        // —— 基于 transfer_id 的 signer seeds ——
         let bump = ctx.bumps.operation_data;
-        let seeds: &[&[u8]] = &[b"operation_data", &[bump]];
-        let signer_seeds: &[&[&[u8]]] = &[seeds];
+        let h = transfer_id_hash_bytes(&transfer_id);
+        let signer_seeds: &[&[&[u8]]] = &[&[b"operation_data", &h, &[bump]]];
+
+        // 基础校验
+        require!(od.initialized, OperationError::NotInitialized);
+        require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
+
+        // ---------- NFT 归属强校验（原逻辑不变） ----------
+        {
+            let nft_acc = spl_token::state::Account::unpack_from_slice(
+                &ctx.accounts.position_nft_account.try_borrow_data()?
+            )?;
+            require!(nft_acc.mint  == ctx.accounts.personal_position.nft_mint, OperationError::Unauthorized);
+            require!(nft_acc.owner == ctx.accounts.user.key(),                 OperationError::Unauthorized);
+            require!(nft_acc.amount == 1,                                       OperationError::Unauthorized);
+        }
 
         // ---------- 新增：仓位归属权强校验 ----------
         {
@@ -540,9 +588,9 @@ pub mod dg_solana_zapin {
                 nft_token_acc.mint == ctx.accounts.personal_position.nft_mint,
                 OperationError::Unauthorized
             );
-            // 2) 该 NFT 的持有人必须是 user_da
+            // 2) 该 NFT 的持有人必须是 user
             require!(
-                nft_token_acc.owner == ctx.accounts.user_da.key(),
+                nft_token_acc.owner == ctx.accounts.user.key(),
                 OperationError::Unauthorized
             );
             // 3) 该账户里应当正好持有 1 枚 NFT
@@ -569,7 +617,7 @@ pub mod dg_solana_zapin {
         {
             let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
                 // nft_owner 不需要签名；我们用 PDA 作为 payer/signer
-                nft_owner:         ctx.accounts.user_da.to_account_info(),
+                nft_owner:         ctx.accounts.user.to_account_info(),
                 nft_account:       ctx.accounts.position_nft_account.to_account_info(),
                 pool_state:        ctx.accounts.pool_state.to_account_info(),
                 protocol_position: ctx.accounts.protocol_position.to_account_info(),
@@ -596,6 +644,12 @@ pub mod dg_solana_zapin {
         let post1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
         let got0 = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
         let got1 = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
+
+        // ========== 新增：可用奖励判断，支持多次 claim ==========
+        if got0 == 0 && got1 == 0 {
+             msg!("No rewards available to claim right now.");
+                return Ok(());
+        }
 
         // 2) 将非 USDC 一侧全量 swap 成 USDC
         let mut total_usdc_after_swap: u64;
@@ -663,7 +717,7 @@ pub mod dg_solana_zapin {
             }
         }
 
-        // 3) 最小到手保护 + 从 PDA 转给 user_da 的 USDC ATA
+        // 3) 最小到手保护 + 从 PDA 转给 user 的 USDC ATA
         require!(total_usdc_after_swap >= p.min_usdc_out, OperationError::InvalidParams);
 
         let (from_acc, usdc_mint_acc) = if usdc_mint == ctx.accounts.input_vault_mint.key() {
@@ -683,47 +737,71 @@ pub mod dg_solana_zapin {
 
         emit!(ClaimEvent {
             pool: ctx.accounts.pool_state.key(),
-            beneficiary: ctx.accounts.user_da.key(),
+            beneficiary: ctx.accounts.user.key(),
             mint: usdc_mint_acc.key(),
             amount: total_usdc_after_swap,
         });
-
-        ctx.accounts.operation_data.executed = true;
 
         Ok(())
     }
 
 
-    pub fn withdraw(ctx: Context<ZapOutExecute>, bounds: PositionBounds, p: ZapOutParams) -> Result<()> {
-        require!(ctx.accounts.operation_data.initialized, OperationError::NotInitialized);
-        require!(!ctx.accounts.operation_data.executed, OperationError::AlreadyExecuted);
-        require!(ctx.accounts.operation_data.amount > 0, OperationError::InvalidAmount);
+    pub fn withdraw(ctx: Context<ZapOutExecute>,
+                    transfer_id: String,
+                    bounds: PositionBounds,
+                    p: ZapOutParams
+    ) -> Result<()> {
+        let od = &ctx.accounts.operation_data;
 
-        let amount            = ctx.accounts.operation_data.amount;
-        let bump              = ctx.bumps.operation_data;
-        let seeds: &[&[u8]]   = &[b"operation_data", &[bump]];
-        let signer_seeds: &[&[&[u8]]] = &[seeds];
+        require!(od.initialized, OperationError::NotInitialized);
+        require!(!od.executed, OperationError::AlreadyExecuted);
+        require!(od.amount > 0, OperationError::InvalidAmount);
 
-        let expected_recipient = if ctx.accounts.operation_data.recipient != Pubkey::default() {
-            ctx.accounts.operation_data.recipient
-        } else {
-            ctx.accounts.operation_data.authority
-        };
+        // —— 基于 transfer_id 的 signer seeds ——
+        let bump = ctx.bumps.operation_data;
+        let h = transfer_id_hash_bytes(&transfer_id);
+        let signer_seeds: &[&[&[u8]]] = &[&[b"operation_data", &h, &[bump]]];
 
-        // 基础校验
-        require!(ctx.accounts.input_token_account.owner == ctx.accounts.operation_data.key(), OperationError::Unauthorized);
-        require!(ctx.accounts.output_token_account.owner == ctx.accounts.operation_data.key(), OperationError::Unauthorized);
-        require!(
-            ctx.accounts.recipient_token_account.owner == expected_recipient,
-            OperationError::Unauthorized
-        );
+        // 期望收款人：沿用你现有逻辑
+        let expected_recipient = if od.recipient != Pubkey::default() { od.recipient } else { od.authority };
+
+        // 基础授权/一致性校验（原逻辑不变）
+        require!(ctx.accounts.input_token_account.owner  == od.key(), OperationError::Unauthorized);
+        require!(ctx.accounts.output_token_account.owner == od.key(), OperationError::Unauthorized);
+        require!(ctx.accounts.recipient_token_account.owner == expected_recipient, OperationError::Unauthorized);
+
         // 目标侧 mint 与收款 ATA 一致
-        let want_mint = if p.want_base {
-            ctx.accounts.input_vault_mint.key()
-        } else {
-            ctx.accounts.output_vault_mint.key()
-        };
+        let want_mint = if p.want_base { ctx.accounts.input_vault_mint.key() } else { ctx.accounts.output_vault_mint.key() };
         require!(ctx.accounts.recipient_token_account.mint == want_mint, OperationError::InvalidMint);
+
+        // —— 运行时派生 protocol_position 并校验（用个人仓位的 tick 与池的 spacing）——
+        let pool = ctx.accounts.pool_state.load()?;
+        let tick_spacing: i32 = pool.tick_spacing.into();
+        let tick_lower = ctx.accounts.personal_position.tick_lower_index;
+        let tick_upper = ctx.accounts.personal_position.tick_upper_index;
+
+        let lower_start = tick_array_start_index(tick_lower, tick_spacing);
+        let upper_start = tick_array_start_index(tick_upper, tick_spacing);
+
+        {
+            let ta_lower = ctx.accounts.tick_array_lower.load()?;
+            let ta_upper = ctx.accounts.tick_array_upper.load()?;
+            require!(ta_lower.start_tick_index == lower_start, OperationError::InvalidParams);
+            require!(ta_upper.start_tick_index == upper_start, OperationError::InvalidParams);
+        }
+
+        let pool_key: Pubkey = ctx.accounts.pool_state.key();
+        let lower_bytes = lower_start.to_be_bytes();
+        let upper_bytes = upper_start.to_be_bytes();
+        let proto_seeds: [&[u8]; 4] = [
+            POSITION_SEED.as_bytes(),
+            pool_key.as_ref(),
+            &lower_bytes,
+            &upper_bytes,
+        ];
+        let clmm_pid: Pubkey = ctx.accounts.clmm_program.key();
+        let (derived_pp, _) = Pubkey::find_program_address(&proto_seeds, &clmm_pid);
+        require!(ctx.accounts.protocol_position.key() == derived_pp, OperationError::InvalidParams);
 
         // 赎回前余额
         let pre0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
@@ -892,7 +970,7 @@ pub mod dg_solana_zapin {
 
         // ---------- Step C: 最低到手 + 与用户期望 amount 的保护 ----------
         require!(total_out >= p.min_payout, OperationError::InvalidParams);
-        require!(total_out >= amount,       OperationError::InvalidParams);
+        require!(total_out >= od.amount,       OperationError::InvalidParams);
 
         // ---------- Step D: 转给收款人 ----------
         let from_acc = if p.want_base {
@@ -960,6 +1038,11 @@ pub mod dg_solana_zapin {
 
 const Q64_U128: u128 = 1u128 << 64;
 
+
+#[inline]
+fn transfer_id_hash_bytes(transfer_id: &str) -> [u8; 32] {
+    solana_hash(transfer_id.as_bytes()).to_bytes()
+}
 #[inline]
 fn amounts_from_liquidity_burn_q64(
     sa: u128,    // sqrt(P_lower) in Q64.64
@@ -998,6 +1081,7 @@ fn amounts_from_liquidity_burn_q64(
     let amount1 = amount1_u256.to_underflow_u64();
     (amount0, amount1)
 }
+
 const TICK_ARRAY_SIZE: i32 = 88; //Raydium/UniV3 每个 TickArray 覆盖 88 个 tick 间隔
 #[inline]
 fn tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
@@ -1082,18 +1166,18 @@ pub struct PositionBounds {
 }
 
 #[derive(Accounts)]
+#[instruction(transfer_id: String)]
 pub struct Claim<'info> {
-    // ZapIn 的 PDA（vault authority）
+    // ZapIn 的 PDA（vault authority），用 transfer_id 维度
     #[account(
         mut,
-        seeds = [b"operation_data"],
+        seeds = [b"operation_data", &transfer_id_hash_bytes(&transfer_id)],
         bump
     )]
     pub operation_data: Account<'info, OperationData>,
 
-    // ============ 只有 user DA（必须签名）才能发起 claim ============
-    /// 用户委托/控制的签名者，限制谁能 claim
-    pub user_da: Signer<'info>,
+    // 只有 user（签名者）才能 claim
+    pub user: Signer<'info>,
 
     // ---------- 池 & 配置 ----------
     #[account(mut)]
@@ -1130,7 +1214,7 @@ pub struct Claim<'info> {
     pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
 
     // ---------- Position（领取手续费所需） ----------
-    /// CHECK: Raydium 会在 CPI 内部做一致性校验
+    /// CHECK: Raydium 内部校验
     #[account(mut)]
     pub position_nft_account: UncheckedAccount<'info>,
     pub personal_position: Box<Account<'info, PersonalPositionState>>,
@@ -1152,10 +1236,10 @@ pub struct Claim<'info> {
     #[account(mut)]
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
 
-    // ---------- 领取目标（必须为 user_da 的 ATA，且 mint=池子 token0/1 中的 USDC 那侧） ----------
+    // ---------- 领取目标（必须为 user 的 ATA，且 mint=池子 token0/1 中的 USDC 那侧） ----------
     #[account(
         mut,
-        constraint = recipient_token_account.owner == user_da.key() @ OperationError::Unauthorized
+        constraint = recipient_token_account.owner == user.key() @ OperationError::Unauthorized
     )]
     pub recipient_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
@@ -1186,20 +1270,21 @@ pub struct ClaimParams {
 
 
 #[derive(Accounts)]
-#[instruction(bounds: PositionBounds)]
+#[instruction(transfer_id: String)]
 pub struct Execute<'info> {
+    // 基于 transfer_id 的 OperationData（PDA 即 vault authority / signer）
     #[account(
         mut,
-        seeds = [b"operation_data"],
+        seeds = [b"operation_data", &transfer_id_hash_bytes(&transfer_id)],
         bump
     )]
     pub operation_data: Box<Account<'info, OperationData>>,
 
-    /// 用户先前 deposit 的代币目前在程序名下，该账户是程序名下的托管账户
+    /// 程序名下托管账户（资金先前由 deposit_v2 存入），owner 必须是 operation_data
     #[account(mut)]
     pub program_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
-    /// 仅用于当实际收到 < 期望 amount_in 时走全额退款
+    /// 仅用于“实际收到 < 期望”时退款
     #[account(mut)]
     pub recipient_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
@@ -1207,7 +1292,7 @@ pub struct Execute<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
-    // --- 程序名下两侧 token 账户（PDA 作为 owner），与池子的 mint 一一对应 ---
+    // --- 程序名下两侧 token 账户（与池子 mint 一一对应，owner=operation_data） ---
     #[account(
         mut,
         constraint = input_token_account.mint == input_vault_mint.key(),
@@ -1221,14 +1306,14 @@ pub struct Execute<'info> {
     )]
     pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
-    /// CHECK: position_nft_mint
+    /// CHECK: position_nft_mint（用 user+pool_state 作种子）
     #[account(
         mut,
         seeds = [b"pos_nft_mint", user.key().as_ref(), pool_state.key().as_ref()],
         bump
     )]
     pub position_nft_mint: UncheckedAccount<'info>,
-    /// CHECK: position_nft_account
+    /// CHECK:
     #[account(mut)]
     pub position_nft_account: UncheckedAccount<'info>,
 
@@ -1238,23 +1323,23 @@ pub struct Execute<'info> {
     #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
 
-    /// 池子金库（两侧），地址与 pool_state 中的一致
+    /// 池子金库（两侧）
     #[account(mut, address = pool_state.load()?.token_vault_0)]
     pub input_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
     #[account(mut, address = pool_state.load()?.token_vault_1)]
     pub output_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
-    /// 价格观测账户（swap 需要）
+    /// 价格观测账户
     #[account(mut, address = pool_state.load()?.observation_key)]
     pub observation_state: AccountLoader<'info, ObservationState>,
 
-    /// 两侧 mint（仅作地址/一致性校验）
+    /// 两侧 mint
     #[account(address = pool_state.load()?.token_mint_0)]
     pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
     #[account(address = pool_state.load()?.token_mint_1)]
     pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
 
-    /// CHECK: spl-memo 程序
+    /// CHECK: spl-memo
     #[account(address = spl_memo::id())]
     pub memo_program: UncheckedAccount<'info>,
 
@@ -1262,43 +1347,27 @@ pub struct Execute<'info> {
     #[account(constraint = clmm_program.key() == RAYDIUM_CLMM_PROGRAM_ID)]
     pub clmm_program: Program<'info, AmmV3>,
 
-    // --- 协议/个人仓位（开仓 & 增加流动性需要） ---
-    #[account(
-        mut,
-        seeds = [
-        POSITION_SEED.as_bytes(),
-        pool_state.key().as_ref(),
-        &bounds.tick_lower.to_be_bytes(),
-        &bounds.tick_upper.to_be_bytes(),
-        ],
-        seeds::program = clmm_program,
-        bump,
-        constraint = protocol_position.pool_id == pool_state.key(),
-    )]
-    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
+    // --- Position（运行时校验，不再依赖 bounds） ---
+    /// CHECK: 运行时派生并 require! 校验
+    #[account(mut)]
+    pub protocol_position: UncheckedAccount<'info>,
     pub personal_position: Box<Account<'info, PersonalPositionState>>,
 
     pub rent: Sysvar<'info, Rent>,
 
-    // --- TickArray，用于校验与作为 CPI 账户传入 ---
+    // --- TickArray（运行时校验） ---
     #[account(mut)]
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
     #[account(mut)]
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
 
-    // --- OpenPositionV2 需要的占位 token 账户（两侧，与金库 mint 匹配）---
-    #[account(
-        mut,
-        constraint = token_account_0.mint == input_vault.mint
-    )]
+    // --- OpenPositionV2 需要的 token 占位账户 ---
+    #[account(mut, constraint = token_account_0.mint == input_vault.mint)]
     pub token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(
-        mut,
-        constraint = token_account_1.mint == output_vault.mint
-    )]
+    #[account(mut, constraint = token_account_1.mint == output_vault.mint)]
     pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
-    /// CHECK: metadata account not necessary
+    /// CHECK:
     #[account(mut)]
     pub metadata_account: UncheckedAccount<'info>,
     pub metadata_program: Program<'info, Metadata>,
@@ -1310,12 +1379,12 @@ pub struct Execute<'info> {
 }
 
 #[derive(Accounts)]
-#[instruction(bounds: PositionBounds)]
+#[instruction(transfer_id: String, bounds: PositionBounds)]
 pub struct ZapOutExecute<'info> {
-    // 程序 PDA（vault authority）
+    // 程序 PDA（vault authority），transfer_id 维度
     #[account(
         mut,
-        seeds = [b"operation_data"],
+        seeds = [b"operation_data", &transfer_id_hash_bytes(&transfer_id)],
         bump
     )]
     pub operation_data: Box<Account<'info, OperationData>>,
@@ -1325,7 +1394,7 @@ pub struct ZapOutExecute<'info> {
     pub recipient_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     // ====== Position / Pool / Raydium 帐户 ======
-    /// CHECK: 仅作转发给 Raydium 的 nft_owner
+    /// CHECK: 仅作转发给 Raydium 的 nft_owner（不要求签名）
     pub user: UncheckedAccount<'info>,
     /// CHECK:
     #[account(mut)]
@@ -1367,20 +1436,10 @@ pub struct ZapOutExecute<'info> {
     #[account(address = pool_state.load()?.token_mint_1)]
     pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
 
-    // Raydium Position（协议/个人）
-    #[account(
-        mut,
-        seeds = [
-        POSITION_SEED.as_bytes(),
-        pool_state.key().as_ref(),
-        &bounds.tick_lower.to_be_bytes(),
-        &bounds.tick_upper.to_be_bytes(),
-        ],
-        seeds::program = clmm_program,
-        bump,
-        constraint = protocol_position.pool_id == pool_state.key(),
-    )]
-    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
+    // Raydium Position（协议/个人）——去掉基于 bounds 的 seeds，改运行时校验
+    /// CHECK: 运行时派生并 require! 校验
+    #[account(mut)]
+    pub protocol_position: UncheckedAccount<'info>,
     pub personal_position: Box<Account<'info, PersonalPositionState>>,
     #[account(mut)]
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
@@ -1422,11 +1481,6 @@ pub struct ModifyPdaAuthority<'info> {
         constraint = current_authority.key() == operation_data.authority @ OperationError::Unauthorized
     )]
     pub current_authority: Signer<'info>,
-}
-
-// Helper function to get swapped amount (placeholder; implement based on your needs)
-fn get_swapped_amount(_output_token_account: &InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
-    Ok(0)
 }
 
 #[account]
