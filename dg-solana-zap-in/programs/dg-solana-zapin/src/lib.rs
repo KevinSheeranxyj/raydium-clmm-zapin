@@ -15,6 +15,7 @@ use raydium_amm_v3::{
     program::AmmV3,
     states::{PoolState, AmmConfig, POSITION_SEED, TICK_ARRAY_SEED, ObservationState, TickArrayState, ProtocolPositionState, PersonalPositionState},
 };
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_lang::solana_program::hash::hash as solana_hash;
 use anchor_lang::solana_program::{
     program::invoke_signed,
@@ -58,21 +59,19 @@ pub mod dg_solana_zapin {
         amount: u64,
         ca: Pubkey,
     ) -> Result<()> {
-        let operation_data = &mut ctx.accounts.operation_data;
+        let od = &mut ctx.accounts.operation_data;
 
-        msg!("op_type = {:?}", operation_type);
-        msg!("action.len() = {}", action.len());
-        if action.len() > 0 {
-            let preview = &action[..core::cmp::min(16, action.len())];
-            msg!("action[0..] = {:?}", preview);
+        // 初始化（首次该 transfer_id）
+        if !od.initialized {
+            od.authority = ctx.accounts.authority.key();
+            od.initialized = true;
+            msg!("Initialized operation_data for transfer_id {} with authority {}", transfer_id, od.authority);
         }
 
-        // Verify transfer params
-        require!(operation_data.initialized, OperationError::NotInitialized);
         require!(amount > 0, OperationError::InvalidAmount);
         require!(!transfer_id.is_empty(), OperationError::InvalidTransferId);
 
-        // Perform SPL token transfer to program token account
+        // 资金转入（保持原逻辑）
         let cpi_accounts = Transfer {
             from: ctx.accounts.authority_ata.to_account_info(),
             to: ctx.accounts.program_token_account.to_account_info(),
@@ -82,404 +81,411 @@ pub mod dg_solana_zapin {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::transfer(cpi_ctx, amount)?;
 
-        // Store transfer details
-        operation_data.transfer_id = transfer_id.clone();
-        operation_data.amount = amount;
-        operation_data.executed = false;
-        operation_data.ca = ca;
+        // 存基础参数
+        od.transfer_id = transfer_id.clone();
+        od.amount = amount;
+        od.executed = false;
+        od.ca = ca;
+        od.operation_type = operation_type.clone();
+        od.action = action.clone(); // 保留原始参数
 
-        operation_data.operation_type = operation_type.clone();
-        operation_data.action = action;
-        if let OperationType::Transfer = operation_type {
-            let p: TransferParams = deserialize_params(&operation_data.action)?;
-            operation_data.recipient = p.recipient;
-        }
+        // ====== 存 Raydium 固定账户（直接从 ctx 读 pubkey）======
+        od.clmm_program_id   = ctx.accounts.clmm_program.key();
+        od.pool_state        = ctx.accounts.pool_state.key();
+        od.amm_config        = ctx.accounts.amm_config.key();
+        od.observation_state = ctx.accounts.observation_state.key();
+        od.token_vault_0     = ctx.accounts.token_vault_0.key();
+        od.token_vault_1     = ctx.accounts.token_vault_1.key();
+        od.token_mint_0      = ctx.accounts.token_mint_0.key();
+        od.token_mint_1      = ctx.accounts.token_mint_1.key();
+
+        // 如果是 ZapIn，解析参数并派生 tick array / protocol_position 等，存起来
         if let OperationType::ZapIn = operation_type {
-            let _p: ZapInParams = deserialize_params(&operation_data.action)?;
+            let p: ZapInParams = deserialize_params(&od.action)?;
+            od.tick_lower = p.tick_lower;
+            od.tick_upper = p.tick_upper;
+
+            // 根据 pool 的 tick_spacing 计算 tick array 起始
+            let pool = ctx.accounts.pool_state.load()?;
+            let tick_spacing: i32 = pool.tick_spacing.into();
+            let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
+            let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
+
+            // Raydium tick array PDA（由外部提供，但我们把“应有地址”存起来用作后续校验）
+            let (ta_lower, _) = Pubkey::find_program_address(
+                &[
+                    TICK_ARRAY_SEED.as_bytes(),
+                    ctx.accounts.pool_state.key().as_ref(),
+                    &lower_start.to_be_bytes(),
+                ],
+                &ctx.accounts.clmm_program.key(),
+            );
+            let (ta_upper, _) = Pubkey::find_program_address(
+                &[
+                    TICK_ARRAY_SEED.as_bytes(),
+                    ctx.accounts.pool_state.key().as_ref(),
+                    &upper_start.to_be_bytes(),
+                ],
+                &ctx.accounts.clmm_program.key(),
+            );
+            od.tick_array_lower = ta_lower;
+            od.tick_array_upper = ta_upper;
+
+            // 协议仓位 PDA（Raydium POSITION_SEED, pool, lower_start, upper_start）
+            let (pp, _) = Pubkey::find_program_address(
+                &[
+                    POSITION_SEED.as_bytes(),
+                    ctx.accounts.pool_state.key().as_ref(),
+                    &lower_start.to_be_bytes(),
+                    &upper_start.to_be_bytes(),
+                ],
+                &ctx.accounts.clmm_program.key(),
+            );
+            od.protocol_position = pp;
+
+            // Position NFT mint（deposit 阶段未持有 user；先置空，execute 再写）
+            od.position_nft_mint = Pubkey::default();
         }
 
-        msg!(
-            "Deposited transfer details: ID={}, Amount={}, Recipient={}",
-            operation_data.transfer_id,
-            operation_data.amount,
-            operation_data.recipient,
-        );
-        emit!(DepositEvent {
-            transfer_id: transfer_id.clone(),
-            amount,
-            recipient: operation_data.recipient,
-        });
+        // 如果是 Transfer，存 recipient
+        if let OperationType::Transfer = operation_type {
+            let p: TransferParams = deserialize_params(&od.action)?;
+            od.recipient = p.recipient;
+        }
+
+        emit!(DepositEvent { transfer_id, amount, recipient: od.recipient });
         Ok(())
     }
 
-    // Execute the token transfer
     // Execute the token transfer (ZapIn only)
     pub fn execute(ctx: Context<Execute>, transfer_id: String) -> Result<()> {
-        let od = &mut ctx.accounts.operation_data;
-
-        // 基础校验
-        require!(od.initialized, OperationError::NotInitialized);
-        require!(!od.executed, OperationError::AlreadyExecuted);
-        require!(od.amount > 0, OperationError::InvalidAmount);
-        require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
-        require!(matches!(od.operation_type, OperationType::ZapIn), OperationError::InvalidParams);
-
-        let amount = od.amount;
-        let ca = od.ca;
-
-        // signer seeds：按 transfer_id
-        let bump = ctx.bumps.operation_data;
-        let h = transfer_id_hash_bytes(&transfer_id);
-        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data", &h, &[bump]];
-        let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
-
-        // 从 OperationData.action 反序列化出 ZapInParams
-        let p: ZapInParams = deserialize_params(&od.action)?;
-        require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
-
-        let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.input_vault_mint.key();
-        // 下面基本沿用你原 execute 里的逻辑：
-        // - 校验 ca 与 input_vault_mint
-        // - 处理“实际 < 期望”时全额退款
-        // - 计算价格、滑点、分配比例、swap、open_position_v2、increase_liquidity_v2 等
-        // - 期间把原来依赖 bounds 的地方，改成使用 p.tick_lower / p.tick_upper
-        // - 对 protocol_position / tick_array_* 做运行时派生与 require! 一致性校验
-
-        require!(ca == ctx.accounts.input_vault_mint.key() || ca == ctx.accounts.output_vault_mint.key(), OperationError::InvalidMint);
-        // 例：运行时派生 protocol_position PDA 并校验
-        let pool = ctx.accounts.pool_state.load()?;
-        let tick_spacing: i32 = pool.tick_spacing.into();
-        let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
-        let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
-
+        // 基础校验（只读借用，立刻结束）
         {
-            let ta_lower = ctx.accounts.tick_array_lower.load()?;
-            let ta_upper = ctx.accounts.tick_array_upper.load()?;
-            require!(ta_lower.start_tick_index == lower_start, OperationError::InvalidParams);
-            require!(ta_upper.start_tick_index == upper_start, OperationError::InvalidParams);
+            let od_ref = &ctx.accounts.operation_data;
+            require!(od_ref.initialized, OperationError::NotInitialized);
+            require!(!od_ref.executed, OperationError::AlreadyExecuted);
+            require!(od_ref.amount > 0, OperationError::InvalidAmount);
+            require!(od_ref.transfer_id == transfer_id, OperationError::InvalidTransferId);
+            require!(matches!(od_ref.operation_type, OperationType::ZapIn), OperationError::InvalidParams);
         }
 
-        // 按 Raydium v3 的 POSITION_SEED 规则派生出应有的 protocol_position 地址并核对
-        let pool_key: Pubkey = ctx.accounts.pool_state.key();
-        let lower_bytes = lower_start.to_be_bytes();
-        let upper_bytes = upper_start.to_be_bytes();
-        let proto_seeds: [&[u8]; 4] = [
-            POSITION_SEED.as_bytes(),
-            pool_key.as_ref(),
-            &lower_bytes,
-            &upper_bytes,
-        ];
-        let clmm_pid: Pubkey = ctx.accounts.clmm_program.key();
-        let (derived_pp, _) = Pubkey::find_program_address(&proto_seeds, &clmm_pid);
-        require!(ctx.accounts.protocol_position.key() == derived_pp, OperationError::InvalidParams);
-
-        // ----------------------------- ZapIn start -----------------------------
-
-        // --- 如果用户实际存入 amount < 期望 p.amount_in，则全额原路退回到 recipient_token_account ---
-        if amount < p.amount_in {
-            // 退回账户必须与程序 token 账户 mint 一致
-            require!(
-            ctx.accounts.recipient_token_account.mint == ctx.accounts.program_token_account.mint,
-            OperationError::InvalidMint
-        );
-            let token_program = ctx.accounts.token_program.to_account_info();
-
-            let refund_accounts = Transfer {
-                from: ctx.accounts.program_token_account.to_account_info(),
-                to: ctx.accounts.recipient_token_account.to_account_info(),
-                authority: ctx.accounts.operation_data.to_account_info()
-            };
-
-            token::transfer(
-                CpiContext::new_with_signer(
-                    token_program,
-                    refund_accounts,
-                    signer_seeds, // PDA 作为 authority
-                ),
-                amount,
-            )?;
-
-            ctx.accounts.operation_data.executed = true;
-            msg!(
-                "ZapIn refund: expected amount_in = {}, received_amount = {}, refund all to recipient",
-                p.amount_in,
-                amount
-            );
-            return Ok(());
-        }
-
-        let sp = {
-            let pool = ctx.accounts.pool_state.load()?; // Ref<PoolState>
-            pool.sqrt_price_x64
+        // 拷出关键字段（结束对 od 的借用）
+        let (
+            pool_state_key, amm_config_key, observation_key,
+            vault0_key, vault1_key, mint0_key, mint1_key,
+            tick_array_lower_key, tick_array_upper_key,
+            protocol_pos_key, ca_mint,
+            amount_total,
+            mut pos_mint, personal_pos_stored,
+            action_bytes, pool_key_for_pos_mint
+        ) = {
+            let od = &ctx.accounts.operation_data;
+            (
+                od.pool_state, od.amm_config, od.observation_state,
+                od.token_vault_0, od.token_vault_1, od.token_mint_0, od.token_mint_1,
+                od.tick_array_lower, od.tick_array_upper,
+                od.protocol_position, od.ca,
+                od.amount,
+                od.position_nft_mint, od.personal_position,
+                od.action.clone(), od.pool_state,
+            )
         };
 
-        // 将 sqrt 价转为价格 P = (sp^2) / Q64
+        // signer seeds
+        let bump = ctx.bumps.operation_data;
+        let h = transfer_id_hash_bytes(&transfer_id);
+        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data".as_ref(), h.as_ref(), &[bump]];
+        let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
+
+        // 关键：不要 clone / to_vec；直接用同一 'info 的切片
+        let ras = ctx.remaining_accounts;
+
+        // pool/config/observation + vaults + mints
+        let pool_state        = find_acc(ras, &pool_state_key,        "pool_state")?;
+        let amm_config        = find_acc(ras, &amm_config_key,        "amm_config")?;
+        let observation       = find_acc(ras, &observation_key,       "observation_state")?;
+        let vault0            = find_acc(ras, &vault0_key,            "token_vault_0")?;
+        let vault1            = find_acc(ras, &vault1_key,            "token_vault_1")?;
+        let mint0             = find_acc(ras, &mint0_key,             "token_mint_0")?;
+        let mint1             = find_acc(ras, &mint1_key,             "token_mint_1")?;
+
+        // tick arrays & protocol position
+        let ta_lower          = find_acc(ras, &tick_array_lower_key,  "tick_array_lower")?;
+        let ta_upper          = find_acc(ras, &tick_array_upper_key,  "tick_array_upper")?;
+        let protocol_pos      = find_acc(ras, &protocol_pos_key,      "protocol_position")?;
+
+        // PDA-owned input/output token accounts (mint0/mint1)
+        let pda_input_ata     = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &mint0_key, "pda_input_token_account")?;
+        let pda_output_ata    = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &mint1_key, "pda_output_token_account")?;
+
+        // program_token_account (the deposit was made here; owner = operation_data PDA)
+        let program_token_account = {
+            let ai = ras.iter().find(|ai| {
+                let Ok(data_ref) = ai.try_borrow_data() else { return false; };
+                if data_ref.len() < spl_token::state::Account::LEN { return false; }
+                if let Ok(acc) = spl_token::state::Account::unpack_from_slice(&data_ref) {
+                    acc.owner == ctx.accounts.operation_data.key() && (acc.mint == mint0_key || acc.mint == mint1_key)
+                } else {
+                    false
+                }
+            }).ok_or_else(|| error!(OperationError::InvalidParams))?;
+            ai.clone()
+        };
+
+        // refund recipient token account (user ATA of the same mint as program_token_account.mint)
+        let program_token_mint = unpack_token_account(&program_token_account)
+            .ok_or_else(|| error!(OperationError::InvalidParams))?
+            .mint;
+        let recipient_refund_ata = find_user_token_by_mint(
+            ras,
+            &ctx.accounts.user.key(),
+            &program_token_mint,
+            "recipient_refund_ata",
+        )?;
+
+        // ---- position NFT mint (PDA of *this* program) & user NFT ATA ----
+        if pos_mint == Pubkey::default() {
+            let (m, _) = Pubkey::find_program_address(
+                &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_key_for_pos_mint.as_ref()],
+                ctx.program_id,
+            );
+            pos_mint = m;
+        }
+        let position_nft_mint_ai = find_acc(ras, &pos_mint, "position_nft_mint")?;
+
+        // user ATA for position NFT
+        let pos_nft_ata_key = anchor_spl::associated_token::get_associated_token_address_with_program_id(
+            &ctx.accounts.user.key(),
+            &pos_mint,
+            &anchor_spl::token::ID,
+        );
+        let position_nft_account = find_acc(ras, &pos_nft_ata_key, "position_nft_account(user ATA)")?;
+
+        // personal_position（优先已存，否则猜测一个可反序列化的）
+        let (personal_position, mut personal_pos_key_maybe) =
+            if personal_pos_stored != Pubkey::default() {
+                (find_acc(ras, &personal_pos_stored, "personal_position")?, None)
+            } else {
+                let guess_ref = ras
+                    .iter()
+                    .find(|ai| is_anchor_account::<raydium_amm_v3::states::PersonalPositionState>(ai))
+                    .ok_or_else(|| {
+                        msg!("missing personal_position in remaining_accounts");
+                        error!(OperationError::InvalidParams)
+                    })?;
+                let guess = guess_ref.clone();
+                (guess, Some(guess_ref.key()))
+            };
+
+        // ---------- parse ZapIn params ----------
+        let p: ZapInParams = deserialize_params(&action_bytes)?;
+        require!(p.tick_lower < p.tick_upper, OperationError::InvalidTickRange);
+
+        // ca must equal one of the pool mints
+        require!(ca_mint == mint0_key || ca_mint == mint1_key, OperationError::InvalidMint);
+
+        // determine which side the deposit came in
+        let is_base_input = program_token_mint == mint0_key;
+
+        // ---------- price/fees ----------
+        let pool_state_data = raydium_amm_v3::states::PoolState::try_deserialize(&mut &pool_state.try_borrow_data()?[..])
+            .map_err(|_| error!(OperationError::InvalidParams))?;
+        let sp = pool_state_data.sqrt_price_x64;
+
         let sp_u = U256::from(sp);
         let q64_u = U256::from(Q64_U128);
         let price_q64 = sp_u.mul_div_floor(sp_u, q64_u).ok_or(error!(OperationError::InvalidParams))?;
-        // 注意：price_q64 也是 Q64.64 定点
 
-        let amount_in_u = U256::from(p.amount_in);
+        // amm_config fees
+        let cfg = raydium_amm_v3::states::AmmConfig::try_deserialize(&mut &amm_config.try_borrow_data()?[..])
+            .map_err(|_| error!(OperationError::InvalidParams))?;
+        let trade_fee_bps: u32 = cfg.trade_fee_rate.into();
+        let protocol_fee_bps: u32 = cfg.protocol_fee_rate.into();
+        let total_fee_bps = trade_fee_bps + protocol_fee_bps;
 
-        // ---- 读取手续费（若有）并做折扣 ----
-        let cfg = ctx.accounts.amm_config.as_ref(); // Box<Account<AmmConfig>>
-        let trade_fee_bps: u32 = cfg.trade_fee_rate.into();           // 例：30 (0.3%)
-        let protocol_fee_bps: u32 = cfg.protocol_fee_rate.into();     // 例：5  (0.05%)，具体以 Raydium 定义为准
-        let total_fee_bps: u32 = trade_fee_bps + protocol_fee_bps;
-
-        // user 滑点（正整数 bps）
         let slip_bps = p.slippage_bps.min(10_000);
-
-        // 综合折扣系数 D = (1 - fee_bps/1e4) * (1 - slip_bps/1e4)
         let one = U256::from(10_000u32);
         let fee_factor = one - U256::from(total_fee_bps);
         let slip_factor = one - U256::from(slip_bps);
-        let discount = fee_factor.mul_div_floor(slip_factor, one).ok_or(error!(OperationError::InvalidParams))?; // /1e4
+        let discount = fee_factor.mul_div_floor(slip_factor, one).ok_or(error!(OperationError::InvalidParams))?;
 
-        // 计算“理想输出”（忽略价格冲击），再乘以折扣
-        let mut min_amount_out_u = if is_base_input {
-            // token0 -> token1: out ≈ in * P
-            // amount_out(Q0) = amount_in * price_q64 / Q64
-            // 先算理想，再乘 discount，再 /1e4
-            let ideal = amount_in_u
-                .mul_div_floor(price_q64, q64_u)
-                .ok_or(error!(OperationError::InvalidParams))?;
-            ideal.mul_div_floor(discount, one).ok_or(error!(OperationError::InvalidParams))?
+        let amount_in_u = U256::from(p.amount_in);
+        let min_amount_out_u = if is_base_input {
+            amount_in_u.mul_div_floor(price_q64, q64_u).ok_or(error!(OperationError::InvalidParams))?
+                .mul_div_floor(discount, one).ok_or(error!(OperationError::InvalidParams))?
         } else {
-            // token1 -> token0: out ≈ in / P
-            // amount_out(Q1) = amount_in * Q64 / price_q64
-            let ideal = amount_in_u
-                .mul_div_floor(q64_u, price_q64.max(U256::from(1u8))) // 防 0
-                .ok_or(error!(OperationError::InvalidParams))?;
-            ideal.mul_div_floor(discount, one).ok_or(error!(OperationError::InvalidParams))?
+            amount_in_u.mul_div_floor(q64_u, price_q64.max(U256::from(1u8))).ok_or(error!(OperationError::InvalidParams))?
+                .mul_div_floor(discount, one).ok_or(error!(OperationError::InvalidParams))?
         };
-
-        // 转 u64，保护下界
         let min_amount_out = min_amount_out_u.to_underflow_u64();
 
-        // 1) 计算区间端点的 sqrt 价格
-        let sa = tick_math::get_sqrt_price_at_tick(p.tick_lower)
-            .map_err(|_| error!(OperationError::InvalidParams))?;
-        let sb = tick_math::get_sqrt_price_at_tick(p.tick_upper)
-            .map_err(|_| error!(OperationError::InvalidParams))?;
-
+        // tick-derived checks / tick array consistency
+        let sa = tick_math::get_sqrt_price_at_tick(p.tick_lower).map_err(|_| error!(OperationError::InvalidParams))?;
+        let sb = tick_math::get_sqrt_price_at_tick(p.tick_upper).map_err(|_| error!(OperationError::InvalidParams))?;
         require!(sa < sb, OperationError::InvalidTickRange);
         require!(sp >= sa && sp <= sb, OperationError::InvalidParams);
 
+        // ---------- refund path when amount < requested ----------
+        if amount_total < p.amount_in {
+            let refund_cpi = Transfer {
+                from:      program_token_account.clone(),
+                to:        recipient_refund_ata.clone(),
+                authority: ctx.accounts.operation_data.to_account_info(),
+            };
+            token::transfer(
+                CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), refund_cpi, signer_seeds),
+                amount_total,
+            )?;
+            ctx.accounts.operation_data.executed = true;
+            msg!("ZapIn refund: expected {}, received {}, refunded all.", p.amount_in, amount_total);
+            return Ok(());
+        }
+
+        // ---------- compute single-swap split ----------
         let sa_u = U256::from(sa);
         let sb_u = U256::from(sb);
-        let sp_u = U256::from(sp);
-
-        let sp_minus_sa = if sp_u >= sa_u { sp_u - sa_u } else { return err!(OperationError::InvalidParams); };
-        let sb_minus_sp = if sb_u >= sp_u { sb_u - sp_u } else { return err!(OperationError::InvalidParams); };
-
-        // 2) 计算一次 swap 的分配比例（Raydium/UniV3 常见公式）
+        let sp_u2 = U256::from(sp);
+        let sp_minus_sa = if sp_u2 >= sa_u { sp_u2 - sa_u } else { return err!(OperationError::InvalidParams); };
+        let sb_minus_sp = if sb_u >= sp_u2 { sb_u - sp_u2 } else { return err!(OperationError::InvalidParams); };
         let r_num = sb_u * sp_minus_sa;
-        let r_den = sp_u * sb_minus_sp;
-
+        let r_den = sp_u2 * sb_minus_sp;
         let frac_den = r_den + r_num;
         require!(frac_den > U256::from(0u8), OperationError::InvalidParams);
 
-        let amount_in = p.amount_in;
-
-        let amount_in_u256 = U256::from(amount_in); // 用户输入
-        let swap_amount_u256 = if is_base_input {
-            amount_in_u256.mul_div_floor(r_num, frac_den).ok_or(error!(OperationError::InvalidParams))?
+        let swap_amount = if is_base_input {
+            U256::from(p.amount_in).mul_div_floor(r_num, frac_den).ok_or(error!(OperationError::InvalidParams))?
         } else {
-            amount_in_u256.mul_div_floor(r_den, frac_den).ok_or(error!(OperationError::InvalidParams))?
-        };
-        let swap_amount = swap_amount_u256.to_underflow_u64();
-        require!(swap_amount as u128 <= u64::MAX as u128, OperationError::InvalidParams);
+            U256::from(p.amount_in).mul_div_floor(r_den, frac_den).ok_or(error!(OperationError::InvalidParams))?
+        }.to_underflow_u64();
 
-        // 3) 把用户在程序名下的存款挪到对应的 input 侧账户
-        let to_acc_info = if is_base_input {
-            ctx.accounts.input_token_account.to_account_info()
-        } else {
-            ctx.accounts.output_token_account.to_account_info()
-        };
-        let fund_move = anchor_spl::token::Transfer {
-            from:      ctx.accounts.program_token_account.to_account_info(),
-            to:        to_acc_info,
+        // ---------- move deposit to proper PDA input/output account ----------
+        let to_acc = if is_base_input { pda_input_ata.clone() } else { pda_output_ata.clone() };
+        let move_cpi = Transfer {
+            from:      program_token_account.clone(),
+            to:        to_acc,
             authority: ctx.accounts.operation_data.to_account_info(),
         };
-        let fund_move_ctx = CpiContext::new(
-            ctx.accounts.token_program.to_account_info(),
-            fund_move,
-        ).with_signer(signer_seeds);
-        // 把用户 deposit 进来的 amount 全部挪过去（后面会用一部分做 swap，剩余的直接加仓）
-        anchor_spl::token::transfer(fund_move_ctx, amount)?;
+        token::transfer(
+            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), move_cpi, signer_seeds),
+            amount_total,
+        )?;
 
-        // 记录 swap 前后余额
-        let pre_out = get_token_balance(&mut ctx.accounts.output_token_account)?;
-        let pre_in  = get_token_balance(&mut ctx.accounts.input_token_account)?;
+        // record balances
+        let pre_out = if is_base_input { load_token_amount(&pda_output_ata)? } else { load_token_amount(&pda_input_ata)? };
+        let pre_in  = if is_base_input { load_token_amount(&pda_input_ata)?  } else { load_token_amount(&pda_output_ata)? };
 
-        // 4) 在池内做单边 swap（base/quote 方向依据 is_base_input）
+        // ---------- swap in pool ----------
         {
-            let clmm          = ctx.accounts.clmm_program.to_account_info();
-            let payer         = ctx.accounts.operation_data.to_account_info();
-            let amm_cfg       = ctx.accounts.amm_config.to_account_info();
-            let pool_state    = ctx.accounts.pool_state.to_account_info();
-            let in_acc        = ctx.accounts.input_token_account.to_account_info();
-            let out_acc       = ctx.accounts.output_token_account.to_account_info();
-            let in_vault      = ctx.accounts.input_vault.to_account_info();
-            let out_vault     = ctx.accounts.output_vault.to_account_info();
-            let obs           = ctx.accounts.observation_state.to_account_info();
-            let token_prog    = ctx.accounts.token_program.to_account_info();
-            let token2022     = ctx.accounts.token_program_2022.to_account_info();
-            let memo          = ctx.accounts.memo_program.to_account_info();
-            let in_mint       = ctx.accounts.input_vault_mint.to_account_info();
-            let out_mint      = ctx.accounts.output_vault_mint.to_account_info();
+            let (in_acc, out_acc, in_vault, out_vault, in_mint, out_mint) = if is_base_input {
+                (pda_input_ata.clone(), pda_output_ata.clone(), vault0.clone(), vault1.clone(), mint0.clone(), mint1.clone())
+            } else {
+                (pda_output_ata.clone(), pda_input_ata.clone(), vault1.clone(), vault0.clone(), mint1.clone(), mint0.clone())
+            };
 
             let swap_accounts = cpi::accounts::SwapSingleV2 {
-                payer: payer,
-                amm_config: amm_cfg,
-                pool_state: pool_state,
-                input_token_account: in_acc,
-                output_token_account: out_acc,
-                input_vault: in_vault,
-                output_vault: out_vault,
-                observation_state: obs,
-                token_program: token_prog,
-                token_program_2022: token2022,
-                memo_program: memo,
-                input_vault_mint: in_mint,
-                output_vault_mint: out_mint,
+                payer:                 ctx.accounts.operation_data.to_account_info(),
+                amm_config:            amm_config.clone(),
+                pool_state:            pool_state.clone(),
+                input_token_account:   in_acc,
+                output_token_account:  out_acc,
+                input_vault:           in_vault,
+                output_vault:          out_vault,
+                observation_state:     observation.clone(),
+                token_program:         ctx.accounts.token_program.to_account_info(),
+                token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
+                memo_program:          ctx.accounts.memo_program.to_account_info(),
+                input_vault_mint:      in_mint,
+                output_vault_mint:     out_mint,
             };
-            let other_amount_threshold = min_amount_out;
-            // 可选：如果你想限制价格滑动方向，给 sqrt_price_limit_x64 一个保守的上下限；
-            // 否则传 0 表示不限制（以 Raydium 当前实现为准）
-            let sqrt_price_limit_x64: u128 = 0;
-
-            let swap_ctx = CpiContext::new(clmm, swap_accounts)
+            let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts)
                 .with_signer(signer_seeds);
-
             cpi::swap_v2(
                 swap_ctx,
                 swap_amount,
-                other_amount_threshold,
-                sqrt_price_limit_x64,
+                min_amount_out,
+                0,
                 is_base_input,
             )?;
         }
 
-        // 成交后余额差
-        let post_out = get_token_balance(&mut ctx.accounts.output_token_account)?;
-        let post_in  = get_token_balance(&mut ctx.accounts.input_token_account)?;
+        // delta after swap
+        let post_out = if is_base_input { load_token_amount(&pda_output_ata)? } else { load_token_amount(&pda_input_ata)? };
+        let post_in  = if is_base_input { load_token_amount(&pda_input_ata)?  } else { load_token_amount(&pda_output_ata)? };
         let received = post_out.checked_sub(pre_out).ok_or(error!(OperationError::InvalidParams))?;
-        let spent    = pre_in.checked_sub(post_in).ok_or(error!(OperationError::InvalidParams))?;
-        let remaining = amount.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
+        let spent    = pre_in.checked_sub(pre_in.min(post_in)).ok_or(error!(OperationError::InvalidParams))?;
+        let remaining = amount_total.checked_sub(spent).ok_or(error!(OperationError::InvalidParams))?;
 
-        {
-            let mint_info = &ctx.accounts.position_nft_mint.to_account_info();
-            if mint_info.data_is_empty() {
-                let mint_space = spl_token::state::Mint::LEN;
-                let rent_lamports = Rent::get()?.minimum_balance(mint_space);
+        // ---------- ensure position_nft_mint account exists (create if empty) ----------
+        if position_nft_mint_ai.data_is_empty() {
+            let mint_space = spl_token::state::Mint::LEN;
+            let rent_lamports = Rent::get()?.minimum_balance(mint_space);
 
-                let create_ix = system_instruction::create_account(
-                    &ctx.accounts.user.key(),                 // 付款人
-                    &ctx.accounts.position_nft_mint.key(),    // 要创建的 mint（PDA）
-                    rent_lamports,
-                    mint_space as u64,
-                    &ctx.accounts.token_program.key(),        // owner = SPL Token Program
-                );
+            let create_ix = system_instruction::create_account(
+                &ctx.accounts.user.key(),
+                &pos_mint,
+                rent_lamports,
+                mint_space as u64,
+                &anchor_spl::token::ID,
+            );
 
-                // 关键：把会临时生成的 key 先保存到局部变量，延长生命周期
-                let user_key: Pubkey = ctx.accounts.user.key();
-                let pool_key: Pubkey = ctx.accounts.pool_state.key();
-                let bump: u8 = ctx.bumps.position_nft_mint;
-                let bump_bytes: [u8; 1] = [bump];
+            // 为 pos_nft_mint PDA 计算 bump
+            let (_pk, bump) = Pubkey::find_program_address(
+                &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_key_for_pos_mint.as_ref()],
+                ctx.program_id,
+            );
+            let bump_bytes = [bump];
 
-                let pos_mint_seeds: &[&[u8]] = &[
-                    b"pos_nft_mint",
-                    user_key.as_ref(),        // <-- 引用局部变量，生命周期足够长
-                    pool_key.as_ref(),        // <-- 同上
-                    &bump_bytes,              // <-- 避免 &[bump] 的临时数组
-                ];
-
-                invoke_signed(
-                    &create_ix,
-                    &[
-                        ctx.accounts.user.to_account_info(),
-                        mint_info.clone(),
-                        ctx.accounts.system_program.to_account_info(),
-                    ],
-                    &[pos_mint_seeds],
-                )?;
-            }
-            // 此时：position_nft_mint 是“已创建但未初始化”的 SPL-Token Mint 账号
-            // 后续交给 Raydium 的 open_position_v2 去 Initialize & Mint 到 position_nft_account
+            let seeds: &[&[u8]] = &[
+                b"pos_nft_mint",
+                ctx.accounts.user.key.as_ref(),
+                pool_key_for_pos_mint.as_ref(),
+                &bump_bytes,
+            ];
+            invoke_signed(
+                &create_ix,
+                &[
+                    ctx.accounts.user.to_account_info(),
+                    position_nft_mint_ai.clone(),
+                    ctx.accounts.system_program.to_account_info(),
+                ],
+                &[seeds],
+            )?;
         }
 
-        // 5) 开仓（铸造仓位 NFT）
+        // ---------- open position (mint NFT) ----------
         {
-            let clmm            = ctx.accounts.clmm_program.to_account_info();
-            let payer           = ctx.accounts.operation_data.to_account_info();
-            let pool_state      = ctx.accounts.pool_state.to_account_info();
-            let nft_owner       = ctx.accounts.user.to_account_info();
-            let nft_mint        = ctx.accounts.position_nft_mint.to_account_info();
-            let nft_account     = ctx.accounts.position_nft_account.to_account_info();
-            let personal_pos    = ctx.accounts.personal_position.to_account_info();
-            let protocol_pos    = ctx.accounts.protocol_position.to_account_info();
-            let ta_lower        = ctx.accounts.tick_array_lower.to_account_info();
-            let ta_upper        = ctx.accounts.tick_array_upper.to_account_info();
-            let token_prog      = ctx.accounts.token_program.to_account_info();
-            let sys_prog        = ctx.accounts.system_program.to_account_info();
-            let rent            = ctx.accounts.rent.to_account_info();
-            let ata_prog        = ctx.accounts.associated_token_program.to_account_info();
-            let token_acc_0     = ctx.accounts.token_account_0.to_account_info();
-            let token_acc_1     = ctx.accounts.token_account_1.to_account_info();
-            let token_vault_0   = ctx.accounts.input_vault.to_account_info();
-            let token_vault_1   = ctx.accounts.output_vault.to_account_info();
-            let vault_0_mint    = ctx.accounts.input_vault_mint.to_account_info();
-            let vault_1_mint    = ctx.accounts.output_vault_mint.to_account_info();
-            let metadata_prog   = ctx.accounts.metadata_program.to_account_info();
-            let metadata        = ctx.accounts.metadata_account.to_account_info();
-            let token2022       = ctx.accounts.token_program_2022.to_account_info();
-
             let open_accounts = cpi::accounts::OpenPositionV2 {
-                payer: payer,
-                pool_state: pool_state,
-                position_nft_owner: nft_owner,
-                position_nft_mint: nft_mint,
-                position_nft_account: nft_account,
-                personal_position: personal_pos,
-                protocol_position: protocol_pos,
-                tick_array_lower: ta_lower,
-                tick_array_upper: ta_upper,
-                token_program: token_prog,
-                system_program: sys_prog,
-                rent: rent,
-                associated_token_program: ata_prog,
-                token_account_0: token_acc_0,
-                token_account_1: token_acc_1,
-                token_vault_0: token_vault_0,
-                token_vault_1: token_vault_1,
-                vault_0_mint: vault_0_mint,
-                vault_1_mint: vault_1_mint,
-                metadata_program: metadata_prog,
-                metadata_account: metadata,
-                token_program_2022: token2022,
+                payer:                   ctx.accounts.operation_data.to_account_info(),
+                pool_state:              pool_state.clone(),
+                position_nft_owner:      ctx.accounts.user.to_account_info(),
+                position_nft_mint:       position_nft_mint_ai.clone(),
+                position_nft_account:    position_nft_account.clone(),
+                personal_position:       personal_position.clone(),
+                protocol_position:       protocol_pos.clone(),
+                tick_array_lower:        ta_lower.clone(),
+                tick_array_upper:        ta_upper.clone(),
+                token_program:           ctx.accounts.token_program.to_account_info(),
+                system_program:          ctx.accounts.system_program.to_account_info(),
+                rent:                    ctx.accounts.rent.to_account_info(),
+                associated_token_program:ctx.accounts.associated_token_program.to_account_info(),
+                token_account_0:         pda_input_ata.clone(),
+                token_account_1:         pda_output_ata.clone(),
+                token_vault_0:           vault0.clone(),
+                token_vault_1:           vault1.clone(),
+                vault_0_mint:           mint0.clone(),
+                vault_1_mint:           mint1.clone(),
+                metadata_program:       ctx.accounts.memo_program.to_account_info(),
+                metadata_account:       position_nft_account.clone(),
+                token_program_2022:     ctx.accounts.token_program_2022.to_account_info(),
             };
 
-            let open_ctx = CpiContext::new(clmm, open_accounts)
-                .with_signer(signer_seeds);
-
-            let pool = ctx.accounts.pool_state.load()?;
+            let pool = pool_state_data;
             let tick_spacing: i32 = pool.tick_spacing.into();
-
             let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
             let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
 
-            {
-                let ta_lower = ctx.accounts.tick_array_lower.load()?;
-                let ta_upper = ctx.accounts.tick_array_upper.load()?;
-
-                require!(ta_lower.start_tick_index == lower_start, OperationError::InvalidParams);
-                require!(ta_upper.start_tick_index == upper_start, OperationError::InvalidParams);
-            }
-
-            let with_metadata = false;
-            let base_flag = Some(true);
+            let open_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), open_accounts)
+                .with_signer(signer_seeds);
 
             cpi::open_position_v2(
                 open_ctx,
@@ -490,497 +496,445 @@ pub mod dg_solana_zapin {
                 0u128,
                 0u64,
                 0u64,
-                with_metadata,
-                base_flag,
+                false,            // with_metadata
+                Some(true),       // base_flag
             )?;
         }
 
-        // 6) 追加流动性（把剩余与对侧收入都注入）
+        // ---------- increase liquidity (use remaining + received) ----------
         {
-            let (amount_0_max, amount_1_max) = if is_base_input {
-                (remaining, received)
-            } else {
-                (received, remaining)
-            };
-
-            let clmm            = ctx.accounts.clmm_program.to_account_info();
-            let nft_owner       = ctx.accounts.user.to_account_info();
-            let nft_account     = ctx.accounts.position_nft_account.to_account_info();
-            let pool_state      = ctx.accounts.pool_state.to_account_info();
-            let protocol_pos    = ctx.accounts.protocol_position.to_account_info();
-            let personal_pos    = ctx.accounts.personal_position.to_account_info();
-            let ta_lower        = ctx.accounts.tick_array_lower.to_account_info();
-            let ta_upper        = ctx.accounts.tick_array_upper.to_account_info();
-            let token_acc_0     = ctx.accounts.input_token_account.to_account_info();
-            let token_acc_1     = ctx.accounts.output_token_account.to_account_info();
-            let token_vault_0   = ctx.accounts.input_vault.to_account_info();
-            let token_vault_1   = ctx.accounts.output_vault.to_account_info();
-            let token_prog      = ctx.accounts.token_program.to_account_info();
-            let token2022       = ctx.accounts.token_program_2022.to_account_info();
-            let v0_mint         = ctx.accounts.input_vault_mint.to_account_info();
-            let v1_mint         = ctx.accounts.output_vault_mint.to_account_info();
+            let (amount_0_max, amount_1_max) = if is_base_input { (remaining, received) } else { (received, remaining) };
 
             let inc_accounts = cpi::accounts::IncreaseLiquidityV2 {
-                nft_owner: nft_owner  ,
-                nft_account: nft_account  ,
-                pool_state: pool_state  ,
-                protocol_position: protocol_pos  ,
-                personal_position: personal_pos  ,
-                tick_array_lower: ta_lower  ,
-                tick_array_upper: ta_upper  ,
-                token_account_0: token_acc_0  ,
-                token_account_1: token_acc_1  ,
-                token_vault_0: token_vault_0  ,
-                token_vault_1: token_vault_1  ,
-                token_program: token_prog  ,
-                token_program_2022: token2022  ,
-                vault_0_mint: v0_mint  ,
-                vault_1_mint: v1_mint  ,
+                nft_owner:               ctx.accounts.user.to_account_info(),
+                nft_account:             position_nft_account.clone(),
+                pool_state:              pool_state.clone(),
+                protocol_position:       protocol_pos.clone(),
+                personal_position:       personal_position.clone(),
+                tick_array_lower:        ta_lower.clone(),
+                tick_array_upper:        ta_upper.clone(),
+                token_account_0:         pda_input_ata.clone(),
+                token_account_1:         pda_output_ata.clone(),
+                token_vault_0:           vault0.clone(),
+                token_vault_1:           vault1.clone(),
+                token_program:           ctx.accounts.token_program.to_account_info(),
+                token_program_2022:      ctx.accounts.token_program_2022.to_account_info(),
+                vault_0_mint:            mint0.clone(),
+                vault_1_mint:            mint1.clone(),
             };
-
-            let inc_ctx = CpiContext::new(clmm  , inc_accounts)
+            let inc_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), inc_accounts)
                 .with_signer(signer_seeds);
-
             cpi::increase_liquidity_v2(
                 inc_ctx,
-                0, // Raydium calculate liquidity
+                0,
                 amount_0_max,
                 amount_1_max,
                 Some(is_base_input),
             )?;
         }
 
-        ctx.accounts.operation_data.executed = true;
+        // 写回（仅在需要时）
+        {
+            let od_mut = &mut ctx.accounts.operation_data;
+            if od_mut.personal_position == Pubkey::default() {
+                if let Some(k) = personal_pos_key_maybe.take() {
+                    od_mut.personal_position = k;
+                }
+            }
+            if od_mut.position_nft_mint == Pubkey::default() {
+                od_mut.position_nft_mint = pos_mint;
+            }
+            od_mut.executed = true;
+        }
+
         Ok(())
     }
 
-
     pub fn claim(ctx: Context<Claim>, transfer_id: String, p: ClaimParams) -> Result<()> {
-        let od = &ctx.accounts.operation_data;
-        // —— 基于 transfer_id 的 signer seeds ——
+        // ---- 先拷 key，立刻结束对 od 的借用 ----
+        let (operation_ai, pool_state_key, amm_config_key, observation_key,
+            token_vault_0_key, token_vault_1_key, token_mint_0_key, token_mint_1_key,
+            tick_array_lower_key, tick_array_upper_key, protocol_position_key, personal_position_key,
+            position_nft_mint_key_opt)
+            = {
+            let od = &ctx.accounts.operation_data;
+            require!(od.initialized, OperationError::NotInitialized);
+            require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
+            (
+                od.to_account_info(),
+                od.pool_state, od.amm_config, od.observation_state,
+                od.token_vault_0, od.token_vault_1, od.token_mint_0, od.token_mint_1,
+                od.tick_array_lower, od.tick_array_upper, od.protocol_position, od.personal_position,
+                if od.position_nft_mint != Pubkey::default() { Some(od.position_nft_mint) } else { None },
+            )
+        };
+
+        // 不复制 remaining_accounts，直接借用
+        let ras = ctx.remaining_accounts;
+
+        // ---- 从 remaining_accounts 抓取所有 Raydium / Vault / Mint / Position 账户 ----
+        let pool_state          = find_acc(ras, &pool_state_key,        "pool_state")?;
+        let amm_config          = find_acc(ras, &amm_config_key,        "amm_config")?;
+        let observation_state   = find_acc(ras, &observation_key,       "observation_state")?;
+        let token_vault_0       = find_acc(ras, &token_vault_0_key,     "token_vault_0")?;
+        let token_vault_1       = find_acc(ras, &token_vault_1_key,     "token_vault_1")?;
+        let token_mint_0        = find_acc(ras, &token_mint_0_key,      "token_mint_0")?;
+        let token_mint_1        = find_acc(ras, &token_mint_1_key,      "token_mint_1")?;
+        let tick_array_lower_ai = find_acc(ras, &tick_array_lower_key,  "tick_array_lower")?;
+        let tick_array_upper_ai = find_acc(ras, &tick_array_upper_key,  "tick_array_upper")?;
+        let protocol_position   = find_acc(ras, &protocol_position_key, "protocol_position")?;
+        let personal_position   = find_acc(ras, &personal_position_key, "personal_position")?;
+
+        let input_token_account  = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &token_mint_0_key, "input_token_account")?;
+        let output_token_account = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &token_mint_1_key, "output_token_account")?;
+
+        // ---- 计算/获取 position NFT mint & ATA ----
+        let pos_mint = position_nft_mint_key_opt.unwrap_or_else(|| {
+            let (m, _) = Pubkey::find_program_address(
+                &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_state_key.as_ref()],
+                &ctx.accounts.operation_data.clmm_program_id,
+            );
+            m
+        });
+        let position_nft_account_key = get_associated_token_address_with_program_id(
+            &ctx.accounts.user.key(), &pos_mint, &anchor_spl::token::ID,
+        );
+        let position_nft_account_ai = find_acc(ras, &position_nft_account_key, "position_nft_account(user ATA of position NFT)")?;
+
+        // ---- NFT 归属校验 ----
+        {
+            let nft_acc = spl_token::state::Account::unpack(&position_nft_account_ai.try_borrow_data()?)
+                .map_err(|_| error!(OperationError::InvalidParams))?;
+            require!(nft_acc.owner == ctx.accounts.user.key(), OperationError::Unauthorized);
+            require!(nft_acc.mint == pos_mint,                  OperationError::Unauthorized);
+            require!(nft_acc.amount == 1,                       OperationError::Unauthorized);
+        }
+
+        // ---- 领取 USDC 的 ATA（从 remaining_accounts 里）----
+        let recipient_token_account =
+            find_user_token_by_mint(ras, &ctx.accounts.user.key(), &token_mint_0_key, "recipient_token_account(token_mint_0)")
+                .or_else(|_| find_user_token_by_mint(ras, &ctx.accounts.user.key(), &token_mint_1_key, "recipient_token_account(token_mint_1)"))?;
+        let usdc_mint = {
+            let acc = spl_token::state::Account::unpack(&recipient_token_account.try_borrow_data()?)
+                .map_err(|_| error!(OperationError::InvalidParams))?;
+            require!(acc.mint == token_mint_0_key || acc.mint == token_mint_1_key, OperationError::InvalidMint);
+            acc.mint
+        };
+
+        // —— 记录 claim 前余额（PDA 名下两边）——
+        let pre0 = load_token_amount(&input_token_account)?;
+        let pre1 = load_token_amount(&output_token_account)?;
+        let pre_usdc = if usdc_mint == token_mint_0_key { pre0 } else { pre1 };
+
+        // seeds
         let bump = ctx.bumps.operation_data;
         let h = transfer_id_hash_bytes(&transfer_id);
-        let signer_seeds: &[&[&[u8]]] = &[&[b"operation_data", &h, &[bump]]];
-
-        // 基础校验
-        require!(od.initialized, OperationError::NotInitialized);
-        require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
-
-        // ---------- NFT 归属强校验（原逻辑不变） ----------
-        {
-            let nft_acc = spl_token::state::Account::unpack_from_slice(
-                &ctx.accounts.position_nft_account.try_borrow_data()?
-            )?;
-            require!(nft_acc.mint  == ctx.accounts.personal_position.nft_mint, OperationError::Unauthorized);
-            require!(nft_acc.owner == ctx.accounts.user.key(),                 OperationError::Unauthorized);
-            require!(nft_acc.amount == 1,                                       OperationError::Unauthorized);
-        }
-
-        // ---------- 新增：仓位归属权强校验 ----------
-        {
-            // 解包仓位 NFT 的 TokenAccount（position_nft_account 必须是该 NFT 的持仓账户）
-            let nft_token_acc = spl_token::state::Account::unpack_from_slice(
-                &ctx.accounts.position_nft_account.try_borrow_data()?
-            )?;
-
-            // 1) NFT mint 必须与个人仓位记录里的 nft_mint 一致
-            require!(
-                nft_token_acc.mint == ctx.accounts.personal_position.nft_mint,
-                OperationError::Unauthorized
-            );
-            // 2) 该 NFT 的持有人必须是 user
-            require!(
-                nft_token_acc.owner == ctx.accounts.user.key(),
-                OperationError::Unauthorized
-            );
-            // 3) 该账户里应当正好持有 1 枚 NFT
-            require!(
-                nft_token_acc.amount == 1,
-                OperationError::Unauthorized
-            );
-        }
-
-        // ---------- 领取币种必须是池子两侧之一（USDC 那侧） ----------
-        let usdc_mint = ctx.accounts.recipient_token_account.mint;
-        require!(
-            usdc_mint == ctx.accounts.input_vault_mint.key()
-                || usdc_mint == ctx.accounts.output_vault_mint.key(),
-            OperationError::InvalidMint
-        );
-
-        // 记录 claim 前余额（PDA 名下两边）
-        let pre0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
-        let pre1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
-        let pre_usdc = if usdc_mint == ctx.accounts.input_vault_mint.key() { pre0 } else { pre1 };
+        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data".as_ref(), h.as_ref(), &[bump]];
+        let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
 
         // 1) 只结算手续费（liquidity=0）
         {
             let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
-                // nft_owner 不需要签名；我们用 PDA 作为 payer/signer
-                nft_owner:         ctx.accounts.user.to_account_info(),
-                nft_account:       ctx.accounts.position_nft_account.to_account_info(),
-                pool_state:        ctx.accounts.pool_state.to_account_info(),
-                protocol_position: ctx.accounts.protocol_position.to_account_info(),
-                personal_position: ctx.accounts.personal_position.to_account_info(),
-                tick_array_lower:  ctx.accounts.tick_array_lower.to_account_info(),
-                tick_array_upper:  ctx.accounts.tick_array_upper.to_account_info(),
-                recipient_token_account_0: ctx.accounts.input_token_account.to_account_info(),
-                recipient_token_account_1: ctx.accounts.output_token_account.to_account_info(),
-                token_vault_0:     ctx.accounts.input_vault.to_account_info(),
-                token_vault_1:     ctx.accounts.output_vault.to_account_info(),
-                token_program:     ctx.accounts.token_program.to_account_info(),
-                token_program_2022:ctx.accounts.token_program_2022.to_account_info(),
-                vault_0_mint:      ctx.accounts.input_vault_mint.to_account_info(),
-                vault_1_mint:      ctx.accounts.output_vault_mint.to_account_info(),
-                memo_program:      ctx.accounts.memo_program.to_account_info(),
+                nft_owner:                 ctx.accounts.user.to_account_info(),
+                nft_account:               position_nft_account_ai.clone(),
+                pool_state:                pool_state.clone(),
+                protocol_position:         protocol_position.clone(),
+                personal_position:         personal_position.clone(),
+                tick_array_lower:          tick_array_lower_ai.clone(),
+                tick_array_upper:          tick_array_upper_ai.clone(),
+                recipient_token_account_0: input_token_account.clone(),
+                recipient_token_account_1: output_token_account.clone(),
+                token_vault_0:             token_vault_0.clone(),
+                token_vault_1:             token_vault_1.clone(),
+                token_program:             ctx.accounts.token_program.to_account_info(),
+                token_program_2022:        ctx.accounts.token_program_2022.to_account_info(),
+                vault_0_mint:              token_mint_0.clone(),
+                vault_1_mint:              token_mint_1.clone(),
+                memo_program:              ctx.accounts.memo_program.to_account_info(),
             };
-            let dec_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), dec_accounts)
-                .with_signer(signer_seeds);
+            let dec_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), dec_accounts).with_signer(signer_seeds);
             cpi::decrease_liquidity_v2(dec_ctx, 0u128, 0u64, 0u64)?;
         }
 
-        // 计算刚刚领取到 PDA 的手续费数量
-        let post0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
-        let post1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
+        // 刚领取到 PDA 的手续费数量
+        let post0 = load_token_amount(&input_token_account)?;
+        let post1 = load_token_amount(&output_token_account)?;
         let got0 = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
         let got1 = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
-
-        // ========== 新增：可用奖励判断，支持多次 claim ==========
         if got0 == 0 && got1 == 0 {
-             msg!("No rewards available to claim right now.");
-                return Ok(());
+            msg!("No rewards available to claim right now.");
+            return Ok(());
         }
 
         // 2) 将非 USDC 一侧全量 swap 成 USDC
-        let mut total_usdc_after_swap: u64;
-        let other_amount_threshold: u64 = 0;
-        let sqrt_price_limit_x64: u128 = 0;
-        if usdc_mint == ctx.accounts.input_vault_mint.key() {
-            total_usdc_after_swap = pre_usdc + got0;
-            if got1 > 0 {
-                let swap_accounts = cpi::accounts::SwapSingleV2 {
-                    payer:               ctx.accounts.operation_data.to_account_info(),
-                    amm_config:          ctx.accounts.amm_config.to_account_info(),
-                    pool_state:          ctx.accounts.pool_state.to_account_info(),
-                    input_token_account: ctx.accounts.output_token_account.to_account_info(), // in: token1
-                    output_token_account:ctx.accounts.input_token_account.to_account_info(),  // out: token0(USDC)
-                    input_vault:         ctx.accounts.output_vault.to_account_info(),
-                    output_vault:        ctx.accounts.input_vault.to_account_info(),
-                    observation_state:   ctx.accounts.observation_state.to_account_info(),
-                    token_program:       ctx.accounts.token_program.to_account_info(),
-                    token_program_2022:  ctx.accounts.token_program_2022.to_account_info(),
-                    memo_program:        ctx.accounts.memo_program.to_account_info(),
-                    input_vault_mint:    ctx.accounts.output_vault_mint.to_account_info(),
-                    output_vault_mint:   ctx.accounts.input_vault_mint.to_account_info(),
+        let mut total_usdc_after_swap = if usdc_mint == token_mint_0_key { pre_usdc + got0 } else { pre_usdc + got1 };
+        if (usdc_mint == token_mint_0_key && got1 > 0) || (usdc_mint == token_mint_1_key && got0 > 0) {
+            let (in_acc, out_acc, in_vault, out_vault, in_mint, out_mint, is_base_input, amount_in) =
+                if usdc_mint == token_mint_0_key {
+                    (output_token_account.clone(), input_token_account.clone(),
+                     token_vault_1.clone(), token_vault_0.clone(),
+                     token_mint_1.clone(), token_mint_0.clone(),
+                     false, got1)
+                } else {
+                    (input_token_account.clone(), output_token_account.clone(),
+                     token_vault_0.clone(), token_vault_1.clone(),
+                     token_mint_0.clone(), token_mint_1.clone(),
+                     true, got0)
                 };
-                let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts)
-                    .with_signer(signer_seeds);
-                cpi::swap_v2(
-                    swap_ctx,
-                    got1,
-                    other_amount_threshold,
-                    sqrt_price_limit_x64,
-                    false,
-                )?;
-                let new_token0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
-                total_usdc_after_swap = new_token0;
-            }
-        } else {
-            total_usdc_after_swap = pre_usdc + got1;
-            if got0 > 0 {
-                let swap_accounts = cpi::accounts::SwapSingleV2 {
-                    payer:               ctx.accounts.operation_data.to_account_info(),
-                    amm_config:          ctx.accounts.amm_config.to_account_info(),
-                    pool_state:          ctx.accounts.pool_state.to_account_info(),
-                    input_token_account: ctx.accounts.input_token_account.to_account_info(),  // in: token0
-                    output_token_account:ctx.accounts.output_token_account.to_account_info(), // out: token1(USDC)
-                    input_vault:         ctx.accounts.input_vault.to_account_info(),
-                    output_vault:        ctx.accounts.output_vault.to_account_info(),
-                    observation_state:   ctx.accounts.observation_state.to_account_info(),
-                    token_program:       ctx.accounts.token_program.to_account_info(),
-                    token_program_2022:  ctx.accounts.token_program_2022.to_account_info(),
-                    memo_program:        ctx.accounts.memo_program.to_account_info(),
-                    input_vault_mint:    ctx.accounts.input_vault_mint.to_account_info(),
-                    output_vault_mint:   ctx.accounts.output_vault_mint.to_account_info(),
-                };
-                let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts)
-                    .with_signer(signer_seeds);
-                cpi::swap_v2(
-                    swap_ctx,
-                    got0,
-                    other_amount_threshold, // no limit
-                    sqrt_price_limit_x64, // no limit
-                    true,
-                )?;
-                let new_token1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
-                total_usdc_after_swap = new_token1;
-            }
+
+            let swap_accounts = cpi::accounts::SwapSingleV2 {
+                payer:                 operation_ai.clone(),
+                amm_config:            amm_config.clone(),
+                pool_state:            pool_state.clone(),
+                input_token_account:   in_acc,
+                output_token_account:  out_acc,
+                input_vault:           in_vault,
+                output_vault:          out_vault,
+                observation_state:     observation_state.clone(),
+                token_program:         ctx.accounts.token_program.to_account_info(),
+                token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
+                memo_program:          ctx.accounts.memo_program.to_account_info(),
+                input_vault_mint:      in_mint,
+                output_vault_mint:     out_mint,
+            };
+            let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts).with_signer(signer_seeds);
+            cpi::swap_v2(swap_ctx, amount_in, 0, 0, is_base_input)?;
+
+            // 刷新 USDC 余额
+            total_usdc_after_swap = if usdc_mint == token_mint_0_key {
+                load_token_amount(&input_token_account)?
+            } else {
+                load_token_amount(&output_token_account)?
+            };
         }
 
         // 3) 最小到手保护 + 从 PDA 转给 user 的 USDC ATA
         require!(total_usdc_after_swap >= p.min_usdc_out, OperationError::InvalidParams);
 
-        let (from_acc, usdc_mint_acc) = if usdc_mint == ctx.accounts.input_vault_mint.key() {
-            (ctx.accounts.input_token_account.to_account_info(), ctx.accounts.input_vault_mint.to_account_info())
+        let transfer_from = if usdc_mint == token_mint_0_key {
+            input_token_account.clone()
         } else {
-            (ctx.accounts.output_token_account.to_account_info(), ctx.accounts.output_vault_mint.to_account_info())
+            output_token_account.clone()
         };
-
-        let cpi_accounts = Transfer {
-            from:      from_acc,
-            to:        ctx.accounts.recipient_token_account.to_account_info(),
-            authority: ctx.accounts.operation_data.to_account_info(),
+        let transfer_accounts = Transfer {
+            from:      transfer_from,
+            to:        recipient_token_account.clone(),
+            authority: operation_ai,
         };
-        let token_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), cpi_accounts)
-            .with_signer(signer_seeds);
+        let token_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_accounts).with_signer(signer_seeds);
         token::transfer(token_ctx, total_usdc_after_swap)?;
 
         emit!(ClaimEvent {
-            pool: ctx.accounts.pool_state.key(),
+            pool: pool_state_key,
             beneficiary: ctx.accounts.user.key(),
-            mint: usdc_mint_acc.key(),
+            mint: usdc_mint,
             amount: total_usdc_after_swap,
         });
 
         Ok(())
     }
 
-
-    pub fn withdraw(ctx: Context<ZapOutExecute>,
-                    transfer_id: String,
-                    bounds: PositionBounds,
-                    p: ZapOutParams
+    pub fn withdraw(
+        ctx: Context<ZapOutExecute>,
+        transfer_id: String,
+        _bounds: PositionBounds,
+        p: ZapOutParams
     ) -> Result<()> {
-        let od = &ctx.accounts.operation_data;
+        // 读 od，拷 key，尽快结束借用
+        let (operation_key, expected_recipient, pool_state_key, amm_config_key, observation_key,
+            token_vault_0_key, token_vault_1_key, token_mint_0_key, token_mint_1_key,
+            tick_array_lower_key, tick_array_upper_key, protocol_position_key, personal_position_key,
+            pos_mint_key_opt)
+            = {
+            let od = &ctx.accounts.operation_data;
 
-        require!(od.initialized, OperationError::NotInitialized);
-        require!(!od.executed, OperationError::AlreadyExecuted);
-        require!(od.amount > 0, OperationError::InvalidAmount);
+            require!(od.initialized, OperationError::NotInitialized);
+            require!(!od.executed, OperationError::AlreadyExecuted);
+            require!(od.amount > 0, OperationError::InvalidAmount);
 
-        // —— 基于 transfer_id 的 signer seeds ——
+            let expected_recipient = if od.recipient != Pubkey::default() { od.recipient } else { od.authority };
+
+            (
+                od.key(),
+                expected_recipient,
+                od.pool_state, od.amm_config, od.observation_state,
+                od.token_vault_0, od.token_vault_1, od.token_mint_0, od.token_mint_1,
+                od.tick_array_lower, od.tick_array_upper, od.protocol_position, od.personal_position,
+                if od.position_nft_mint != Pubkey::default() { Some(od.position_nft_mint) } else { None },
+            )
+        };
+
+        // seeds
         let bump = ctx.bumps.operation_data;
         let h = transfer_id_hash_bytes(&transfer_id);
-        let signer_seeds: &[&[&[u8]]] = &[&[b"operation_data", &h, &[bump]]];
+        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data".as_ref(), h.as_ref(), &[bump]];
+        let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
 
-        // 期望收款人：沿用你现有逻辑
-        let expected_recipient = if od.recipient != Pubkey::default() { od.recipient } else { od.authority };
+        // 关键：不要复制，直接借用
+        let ras = ctx.remaining_accounts;
 
-        // 基础授权/一致性校验（原逻辑不变）
-        require!(ctx.accounts.input_token_account.owner  == od.key(), OperationError::Unauthorized);
-        require!(ctx.accounts.output_token_account.owner == od.key(), OperationError::Unauthorized);
-        require!(ctx.accounts.recipient_token_account.owner == expected_recipient, OperationError::Unauthorized);
+        // ---- 从 remaining_accounts 抓所有账户 ----
+        let pool_state          = find_acc(ras, &pool_state_key,        "pool_state")?;
+        let amm_config          = find_acc(ras, &amm_config_key,        "amm_config")?;
+        let observation_state   = find_acc(ras, &observation_key,       "observation_state")?;
+        let token_vault_0       = find_acc(ras, &token_vault_0_key,     "token_vault_0")?;
+        let token_vault_1       = find_acc(ras, &token_vault_1_key,     "token_vault_1")?;
+        let token_mint_0        = find_acc(ras, &token_mint_0_key,      "token_mint_0")?;
+        let token_mint_1        = find_acc(ras, &token_mint_1_key,      "token_mint_1")?;
+        let tick_array_lower_ai = find_acc(ras, &tick_array_lower_key,  "tick_array_lower")?;
+        let tick_array_upper_ai = find_acc(ras, &tick_array_upper_key,  "tick_array_upper")?;
+        let protocol_position   = find_acc(ras, &protocol_position_key, "protocol_position")?;
+        let personal_position   = find_acc(ras, &personal_position_key, "personal_position")?;
 
-        // 目标侧 mint 与收款 ATA 一致
-        let want_mint = if p.want_base { ctx.accounts.input_vault_mint.key() } else { ctx.accounts.output_vault_mint.key() };
-        require!(ctx.accounts.recipient_token_account.mint == want_mint, OperationError::InvalidMint);
+        let input_token_account  = find_pda_token_by_mint(ras, &operation_key, &token_mint_0_key, "input_token_account")?;
+        let output_token_account = find_pda_token_by_mint(ras, &operation_key, &token_mint_1_key, "output_token_account")?;
 
-        // —— 运行时派生 protocol_position 并校验（用个人仓位的 tick 与池的 spacing）——
-        let pool = ctx.accounts.pool_state.load()?;
-        let tick_spacing: i32 = pool.tick_spacing.into();
-        let tick_lower = ctx.accounts.personal_position.tick_lower_index;
-        let tick_upper = ctx.accounts.personal_position.tick_upper_index;
-
-        let lower_start = tick_array_start_index(tick_lower, tick_spacing);
-        let upper_start = tick_array_start_index(tick_upper, tick_spacing);
-
+        // ---- 校验收款人 ATA ----
+        let rec_acc = ctx.accounts.recipient_token_account.to_account_info();
         {
-            let ta_lower = ctx.accounts.tick_array_lower.load()?;
-            let ta_upper = ctx.accounts.tick_array_upper.load()?;
-            require!(ta_lower.start_tick_index == lower_start, OperationError::InvalidParams);
-            require!(ta_upper.start_tick_index == upper_start, OperationError::InvalidParams);
+            let ta = spl_token::state::Account::unpack(&rec_acc.try_borrow_data()?)
+                .map_err(|_| error!(OperationError::InvalidParams))?;
+            require!(ta.owner == expected_recipient, OperationError::Unauthorized);
+            let want_mint = if p.want_base { token_mint_0_key } else { token_mint_1_key };
+            require!(ta.mint == want_mint, OperationError::InvalidMint);
         }
 
-        let pool_key: Pubkey = ctx.accounts.pool_state.key();
-        let lower_bytes = lower_start.to_be_bytes();
-        let upper_bytes = upper_start.to_be_bytes();
-        let proto_seeds: [&[u8]; 4] = [
-            POSITION_SEED.as_bytes(),
-            pool_key.as_ref(),
-            &lower_bytes,
-            &upper_bytes,
-        ];
-        let clmm_pid: Pubkey = ctx.accounts.clmm_program.key();
-        let (derived_pp, _) = Pubkey::find_program_address(&proto_seeds, &clmm_pid);
-        require!(ctx.accounts.protocol_position.key() == derived_pp, OperationError::InvalidParams);
-
         // 赎回前余额
-        let pre0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
-        let pre1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
+        let pre0 = load_token_amount(&input_token_account)?;
+        let pre1 = load_token_amount(&output_token_account)?;
 
-        // 读取仓位与价格
-        let full_liquidity: u128 = ctx.accounts.personal_position.liquidity;
+        // 读取 position（用于估算最小值）
+        let pp_data = personal_position.try_borrow_data()?;
+        let pp = raydium_amm_v3::states::PersonalPositionState::try_deserialize(&mut &pp_data[..])
+            .map_err(|_| error!(OperationError::InvalidParams))?;
+        let full_liquidity: u128 = pp.liquidity;
         require!(full_liquidity > 0, OperationError::InvalidParams);
+        let burn_liq: u128 = if p.liquidity_to_burn_u64 > 0 { p.liquidity_to_burn_u64 as u128 } else { full_liquidity };
+        require!(burn_liq <= full_liquidity, OperationError::InvalidParams);
 
-        let burn_liquidity_u128: u128 = if p.liquidity_to_burn_u64 > 0 {
-            p.liquidity_to_burn_u64 as u128
-        } else {
-            full_liquidity
-        };
-        require!(burn_liquidity_u128 <= full_liquidity, OperationError::InvalidParams);
+        let tick_lower = pp.tick_lower_index;
+        let tick_upper = pp.tick_upper_index;
 
-        let tick_lower = ctx.accounts.personal_position.tick_lower_index;
-        let tick_upper = ctx.accounts.personal_position.tick_upper_index;
-
-        let sa = tick_math::get_sqrt_price_at_tick(tick_lower)
-            .map_err(|_| error!(OperationError::InvalidParams))?;
-        let sb = tick_math::get_sqrt_price_at_tick(tick_upper)
-            .map_err(|_| error!(OperationError::InvalidParams))?;
+        let sa = tick_math::get_sqrt_price_at_tick(tick_lower).map_err(|_| error!(OperationError::InvalidParams))?;
+        let sb = tick_math::get_sqrt_price_at_tick(tick_upper).map_err(|_| error!(OperationError::InvalidParams))?;
         require!(sa < sb, OperationError::InvalidTickRange);
 
+        // 当前价
         let sp = {
-            let pool = ctx.accounts.pool_state.load()?;
-            pool.sqrt_price_x64
+            let ps = raydium_amm_v3::states::PoolState::try_deserialize(&mut &pool_state.try_borrow_data()?[..])
+                .map_err(|_| error!(OperationError::InvalidParams))?;
+            ps.sqrt_price_x64
         };
 
-        // 估算期望拿回量，生成最小保护
-        let (est0, est1) = amounts_from_liquidity_burn_q64(sa, sb, sp, burn_liquidity_u128);
+        // 估算最小到手
+        let (est0, est1) = amounts_from_liquidity_burn_q64(sa, sb, sp, burn_liq);
         let min0 = apply_slippage_min(est0, p.slippage_bps);
         let min1 = apply_slippage_min(est1, p.slippage_bps);
 
-        // ---------- Step A: 赎回（DecreaseLiquidityV2），收款直达 PDA 名下 input/output_token_account ----------
+        // 预先计算 user 的 position NFT ATA（从 remaining_accounts 找到拥有型）
+        let position_nft_account_ai = {
+            let pos_mint = pos_mint_key_opt.unwrap_or_else(|| {
+                let (m, _) = Pubkey::find_program_address(
+                    &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_state_key.as_ref()],
+                    &ctx.accounts.operation_data.clmm_program_id,
+                );
+                m
+            });
+            let ata = get_associated_token_address_with_program_id(
+                &ctx.accounts.user.key(),
+                &pos_mint,
+                &anchor_spl::token::ID,
+            );
+            find_acc(ras, &ata, "position_nft_account")?
+        };
+
+        // ---------- A: 赎回 ----------
         {
-            let clmm            = ctx.accounts.clmm_program.to_account_info();
-            let nft_owner       = ctx.accounts.user.to_account_info();
-            let nft_account     = ctx.accounts.position_nft_account.to_account_info();
-            let pool_state      = ctx.accounts.pool_state.to_account_info();
-            let protocol_pos    = ctx.accounts.protocol_position.to_account_info();
-            let personal_pos    = ctx.accounts.personal_position.to_account_info();
-            let ta_lower        = ctx.accounts.tick_array_lower.to_account_info();
-            let ta_upper        = ctx.accounts.tick_array_upper.to_account_info();
-            let rec0            = ctx.accounts.input_token_account.to_account_info();
-            let rec1            = ctx.accounts.output_token_account.to_account_info();
-            let token_vault_0   = ctx.accounts.input_vault.to_account_info();
-            let token_vault_1   = ctx.accounts.output_vault.to_account_info();
-            let token_prog      = ctx.accounts.token_program.to_account_info();
-            let token2022       = ctx.accounts.token_program_2022.to_account_info();
-            let v0_mint         = ctx.accounts.input_vault_mint.to_account_info();
-            let v1_mint         = ctx.accounts.output_vault_mint.to_account_info();
-            let memo            = ctx.accounts.memo_program.to_account_info();
-
             let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
-                nft_owner: nft_owner,
-                nft_account: nft_account,
-                pool_state: pool_state,
-                protocol_position: protocol_pos,
-                personal_position: personal_pos,
-                tick_array_lower: ta_lower,
-                tick_array_upper: ta_upper,
-                recipient_token_account_0: rec0,
-                recipient_token_account_1: rec1,
-                token_vault_0: token_vault_0,
-                token_vault_1: token_vault_1,
-                token_program: token_prog,
-                token_program_2022: token2022,
-                vault_0_mint: v0_mint,
-                vault_1_mint: v1_mint,
-                memo_program: memo,
+                nft_owner:                 ctx.accounts.user.to_account_info(),
+                nft_account:               position_nft_account_ai.clone(),
+                pool_state:                pool_state.clone(),
+                protocol_position:         protocol_position.clone(),
+                personal_position:         personal_position.clone(),
+                tick_array_lower:          tick_array_lower_ai.clone(),
+                tick_array_upper:          tick_array_upper_ai.clone(),
+                recipient_token_account_0: input_token_account.clone(),
+                recipient_token_account_1: output_token_account.clone(),
+                token_vault_0:             token_vault_0.clone(),
+                token_vault_1:             token_vault_1.clone(),
+                token_program:             ctx.accounts.token_program.to_account_info(),
+                token_program_2022:        ctx.accounts.token_program_2022.to_account_info(),
+                vault_0_mint:              token_mint_0.clone(),
+                vault_1_mint:              token_mint_1.clone(),
+                memo_program:              ctx.accounts.memo_program.to_account_info(),
             };
-
-            let dec_ctx = CpiContext::new(clmm, dec_accounts).with_signer(signer_seeds);
-
-            cpi::decrease_liquidity_v2(
-                dec_ctx,
-                burn_liquidity_u128,
-                min0,
-                min1,
-            )?;
+            let dec_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), dec_accounts)
+                .with_signer(signer_seeds);
+            cpi::decrease_liquidity_v2(dec_ctx, burn_liq, min0, min1)?;
         }
 
-        // 赎回后余额增量
-        let post0 = get_token_balance(&mut ctx.accounts.input_token_account)?;
-        let post1 = get_token_balance(&mut ctx.accounts.output_token_account)?;
+        // 赎回后增量
+        let post0 = load_token_amount(&input_token_account)?;
+        let post1 = load_token_amount(&output_token_account)?;
         let got0  = post0.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
         let got1  = post1.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
 
-        // ---------- Step B: 单边换（可选） ----------
+        // ---------- B: 单边换（可选） ----------
         let (mut total_out, swap_amount, is_base_input) = if p.want_base {
-            (got0, got1, false) // 需要 base，手里的 quote 全部换成 base
+            (got0, got1, false)
         } else {
-            (got1, got0, true)  // 需要 quote，手里的 base 全部换成 quote
+            (got1, got0, true)
         };
 
         if swap_amount > 0 {
-            let clmm       = ctx.accounts.clmm_program.to_account_info();
-            let payer      = ctx.accounts.operation_data.to_account_info();
-            let amm_cfg    = ctx.accounts.amm_config.to_account_info();
-            let pool_state = ctx.accounts.pool_state.to_account_info();
-
             let (in_acc, out_acc, in_vault, out_vault, in_mint, out_mint) =
                 if p.want_base {
-                    (
-                        ctx.accounts.output_token_account.to_account_info(),
-                        ctx.accounts.input_token_account.to_account_info(),
-                        ctx.accounts.output_vault.to_account_info(),
-                        ctx.accounts.input_vault.to_account_info(),
-                        ctx.accounts.output_vault_mint.to_account_info(),
-                        ctx.accounts.input_vault_mint.to_account_info(),
-                    )
+                    (output_token_account.clone(), input_token_account.clone(),
+                     token_vault_1.clone(), token_vault_0.clone(),
+                     token_mint_1.clone(), token_mint_0.clone())
                 } else {
-                    (
-                        ctx.accounts.input_token_account.to_account_info(),
-                        ctx.accounts.output_token_account.to_account_info(),
-                        ctx.accounts.input_vault.to_account_info(),
-                        ctx.accounts.output_vault.to_account_info(),
-                        ctx.accounts.input_vault_mint.to_account_info(),
-                        ctx.accounts.output_vault_mint.to_account_info(),
-                    )
+                    (input_token_account.clone(), output_token_account.clone(),
+                     token_vault_0.clone(), token_vault_1.clone(),
+                     token_mint_0.clone(), token_mint_1.clone())
                 };
-            let obs        = ctx.accounts.observation_state.to_account_info();
-            let token_prog = ctx.accounts.token_program.to_account_info();
-            let token2022  = ctx.accounts.token_program_2022.to_account_info();
-            let memo       = ctx.accounts.memo_program.to_account_info();
-            let other_amount_threshold: u64 = 0;
-            let sqrt_price_limit_x64: u128 = 0;
 
             let swap_accounts = cpi::accounts::SwapSingleV2 {
-                payer: payer,
-                amm_config: amm_cfg,
-                pool_state: pool_state,
-                input_token_account: in_acc,
-                output_token_account: out_acc,
-                input_vault: in_vault,
-                output_vault: out_vault,
-                observation_state: obs,
-                token_program: token_prog,
-                token_program_2022: token2022,
-                memo_program: memo,
-                input_vault_mint: in_mint,
-                output_vault_mint: out_mint,
+                payer:                 ctx.accounts.operation_data.to_account_info(),
+                amm_config:            amm_config.clone(),
+                pool_state:            pool_state.clone(),
+                input_token_account:   in_acc,
+                output_token_account:  out_acc,
+                input_vault:           in_vault,
+                output_vault:          out_vault,
+                observation_state:     observation_state.clone(),
+                token_program:         ctx.accounts.token_program.to_account_info(),
+                token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
+                memo_program:          ctx.accounts.memo_program.to_account_info(),
+                input_vault_mint:      in_mint,
+                output_vault_mint:     out_mint,
             };
-
-            let swap_ctx = CpiContext::new(clmm, swap_accounts).with_signer(signer_seeds);
-
-            cpi::swap_v2(
-                swap_ctx,
-                swap_amount,
-                other_amount_threshold,
-                sqrt_price_limit_x64,
-                is_base_input,
-            )?;
+            let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts)
+                .with_signer(signer_seeds);
+            cpi::swap_v2(swap_ctx, swap_amount, 0, 0, is_base_input)?;
 
             // 刷新单边后的总量
-            if p.want_base {
-                let new_base = get_token_balance(&mut ctx.accounts.input_token_account)?;
-                total_out = new_base.checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?;
+            total_out = if p.want_base {
+                load_token_amount(&input_token_account)?
+                    .checked_sub(pre0).ok_or(error!(OperationError::InvalidParams))?
             } else {
-                let new_quote = get_token_balance(&mut ctx.accounts.output_token_account)?;
-                total_out = new_quote.checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?;
-            }
+                load_token_amount(&output_token_account)?
+                    .checked_sub(pre1).ok_or(error!(OperationError::InvalidParams))?
+            };
         }
 
-        // ---------- Step C: 最低到手 + 与用户期望 amount 的保护 ----------
+        // ---------- C: 最低到手 ----------
         require!(total_out >= p.min_payout, OperationError::InvalidParams);
-        require!(total_out >= od.amount,       OperationError::InvalidParams);
 
-        // ---------- Step D: 转给收款人 ----------
-        let from_acc = if p.want_base {
-            ctx.accounts.input_token_account.to_account_info()
-        } else {
-            ctx.accounts.output_token_account.to_account_info()
-        };
+        // ---------- D: 打款给收款人 ----------
+        let from_acc = if p.want_base { input_token_account.clone() } else { output_token_account.clone() };
         let cpi_accounts = Transfer {
-            from: from_acc,
-            to:   ctx.accounts.recipient_token_account.to_account_info(),
+            from:      from_acc,
+            to:        rec_acc.clone(),
             authority: ctx.accounts.operation_data.to_account_info(),
         };
         token::transfer(
@@ -988,29 +942,7 @@ pub mod dg_solana_zapin {
             total_out,
         )?;
 
-        // ---------- Step E: 若仓位已空，关闭仓位 ----------
-        if ctx.accounts.personal_position.liquidity == 0 {
-            let clmm         = ctx.accounts.clmm_program.to_account_info();
-            let protocol_pos = ctx.accounts.protocol_position.to_account_info();
-            let personal_pos = ctx.accounts.personal_position.to_account_info();
-            let nft_mint     = ctx.accounts.position_nft_mint.to_account_info();
-            let nft_account  = ctx.accounts.position_nft_account.to_account_info();
-            let token_prog   = ctx.accounts.token_program.to_account_info();
-            let sys_prog     = ctx.accounts.system_program.to_account_info();
-
-            let close_accounts = cpi::accounts::ClosePosition {
-                nft_owner: protocol_pos,
-                personal_position: personal_pos,
-                position_nft_mint: nft_mint,
-                position_nft_account: nft_account,
-                token_program: token_prog,
-                system_program: sys_prog,
-            };
-            let close_ctx = CpiContext::new(clmm, close_accounts).with_signer(signer_seeds);
-            cpi::close_position(close_ctx)?;
-            msg!("Position closed and NFT burned.");
-        }
-
+        // 标记执行完毕
         ctx.accounts.operation_data.executed = true;
         Ok(())
     }
@@ -1036,8 +968,70 @@ pub mod dg_solana_zapin {
     }
 }
 
-const Q64_U128: u128 = 1u128 << 64;
+fn find_acc<'info>(ras: &'info [AccountInfo<'info>], key: &Pubkey, label: &str) -> Result<AccountInfo<'info>> {
+    let ai = ras.iter().find(|ai| ai.key == key).ok_or_else(|| {
+        msg!("missing account in remaining_accounts: {} = {}", label, key);
+        error!(OperationError::InvalidParams)
+    })?;
+    Ok(ai.clone()) // 关键：克隆成“拥有型”AccountInfo
+}
+fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
+    let data = ai.try_borrow_data().ok()?;
+    spl_token::state::Account::unpack_from_slice(&data).ok()
+}
+fn find_pda_token_by_mint<'info>(
+    ras: &'info [AccountInfo<'info>],
+    owner: &Pubkey,
+    mint: &Pubkey,
+    label: &str,
+) -> Result<AccountInfo<'info>> {
+    for ai in ras {
+        if let Some(ta) = unpack_token_account(ai) {
+            if ta.owner == *owner && ta.mint == *mint {
+                return Ok(ai.clone()); // 返回 owned AccountInfo
+            }
+        }
+    }
+    msg!("missing account in remaining_accounts: {} (owner={}, mint={})", label, owner, mint);
+    err!(OperationError::InvalidParams)
+}
 
+fn find_user_token_by_mint<'info>(
+    ras: &'info [AccountInfo<'info>],
+    user: &Pubkey,
+    mint: &Pubkey,
+    label: &str,
+) -> Result<AccountInfo<'info>> {
+    for ai in ras {
+        if let Some(ta) = unpack_token_account(ai) {
+            if ta.owner == *user && ta.mint == *mint {
+                return Ok(ai.clone()); // 返回 owned AccountInfo
+            }
+        }
+    }
+    msg!("missing account in remaining_accounts: {} (owner=user {}, mint={})", label, user, mint);
+    err!(OperationError::InvalidParams)
+}
+
+fn try_deser_anchor_account<T: AccountDeserialize>(ai: &AccountInfo) -> Option<T> {
+    let data_ref = ai.try_borrow_data().ok()?;   // Ref<[u8]>
+    let mut bytes: &[u8] = &data_ref;            // &Ref<[u8]> -> &[u8]
+    T::try_deserialize(&mut bytes).ok()
+}
+
+/// 只检查某 AccountInfo 是否是某个 Anchor 类型（通过 try_deserialize 是否成功）
+fn is_anchor_account<T: AccountDeserialize>(ai: &AccountInfo) -> bool {
+    try_deser_anchor_account::<T>(ai).is_some()
+}
+
+fn load_token_amount(ai: &AccountInfo) -> Result<u64> {
+    let data = ai.try_borrow_data()?;
+    let acc = spl_token::state::Account::unpack_from_slice(&data)
+        .map_err(|_| error!(OperationError::InvalidParams))?;
+    Ok(acc.amount)
+}
+
+const Q64_U128: u128 = 1u128 << 64;
 
 #[inline]
 fn transfer_id_hash_bytes(transfer_id: &str) -> [u8; 32] {
@@ -1095,12 +1089,6 @@ fn tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
     q * span
 }
 
-
-fn get_token_balance(acc: &mut InterfaceAccount<InterfaceTokenAccount>) -> Result<u64> {
-    acc.reload()?; // Fetch the latest on-chain data
-    Ok(acc.amount)
-}
-
 /// Helper function to deserialize params
 fn deserialize_params<T: AnchorDeserialize>(data: &[u8]) -> Result<T> {
     T::try_from_slice(data).map_err(|_| error!(OperationError::InvalidParams))
@@ -1131,32 +1119,61 @@ pub struct Initialize<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(transfer_id: String)]
 pub struct Deposit<'info> {
     #[account(
-        mut,
-        seeds = [b"operation_data"],
+        init_if_needed,
+        payer = authority,
+        space = 8 + OperationData::LEN,
+        seeds = [
+        b"operation_data".as_ref(),
+        transfer_id_hash_bytes(&transfer_id).as_ref(),
+        ],
         bump
     )]
-    pub operation_data: Box<Account<'info, OperationData>>,
-    #[account(
-        mut,
-        constraint = authority.key() == operation_data.authority @ OperationError::Unauthorized
-    )]
+    pub operation_data: Account<'info, OperationData>,
+
+    #[account(mut)]
     pub authority: Signer<'info>,
+
     #[account(
         mut,
         constraint = authority_ata.owner == authority.key() @ OperationError::Unauthorized
     )]
     pub authority_ata: Account<'info, TokenAccount>,
+
     #[account(
         mut,
         constraint = program_token_account.owner == operation_data.key() @ OperationError::InvalidProgramAccount
     )]
     pub program_token_account: Account<'info, TokenAccount>,
-    #[account(
-        constraint = token_program.key() == token::ID @ OperationError::InvalidTokenProgram
-    )]
+
+    // ===== 新增：Raydium CPI 相关账户（只读一致性，deposit 时校验并落库） =====
+    #[account(constraint = clmm_program.key() == RAYDIUM_CLMM_PROGRAM_ID)]
+    pub clmm_program: Program<'info, AmmV3>,
+
+    // 池 & 配置
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+    #[account(address = pool_state.load()?.amm_config)]
+    pub amm_config: Box<Account<'info, AmmConfig>>,
+    #[account(mut, address = pool_state.load()?.observation_key)]
+    pub observation_state: AccountLoader<'info, ObservationState>,
+
+    // Vault & Mint
+    #[account(mut, address = pool_state.load()?.token_vault_0)]
+    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+    #[account(mut, address = pool_state.load()?.token_vault_1)]
+    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+    #[account(address = pool_state.load()?.token_mint_0)]
+    pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
+    #[account(address = pool_state.load()?.token_mint_1)]
+    pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
+
+    // 系统/程序
+    #[account(constraint = token_program.key() == token::ID @ OperationError::InvalidTokenProgram)]
     pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -1171,77 +1188,13 @@ pub struct Claim<'info> {
     // ZapIn 的 PDA（vault authority），用 transfer_id 维度
     #[account(
         mut,
-        seeds = [b"operation_data", &transfer_id_hash_bytes(&transfer_id)],
+        seeds = [b"operation_data".as_ref(), transfer_id_hash_bytes(&transfer_id).as_ref()],
         bump
     )]
     pub operation_data: Account<'info, OperationData>,
 
     // 只有 user（签名者）才能 claim
     pub user: Signer<'info>,
-
-    // ---------- 池 & 配置 ----------
-    #[account(mut)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-    #[account(address = pool_state.load()?.amm_config)]
-    pub amm_config: Box<Account<'info, AmmConfig>>,
-
-    // PDA 名下两侧代币账户（分别匹配 vault mint）
-    #[account(
-        mut,
-        constraint = input_token_account.mint == input_vault_mint.key(),
-        constraint = input_token_account.owner == operation_data.key()
-    )]
-    pub input_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(
-        mut,
-        constraint = output_token_account.mint == output_vault_mint.key(),
-        constraint = output_token_account.owner == operation_data.key()
-    )]
-    pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    // 池金库 & 观测
-    #[account(mut, address = pool_state.load()?.token_vault_0)]
-    pub input_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = pool_state.load()?.token_vault_1)]
-    pub output_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = pool_state.load()?.observation_key)]
-    pub observation_state: AccountLoader<'info, ObservationState>,
-
-    // 两侧 mint（只读一致性）
-    #[account(address = pool_state.load()?.token_mint_0)]
-    pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = pool_state.load()?.token_mint_1)]
-    pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-
-    // ---------- Position（领取手续费所需） ----------
-    /// CHECK: Raydium 内部校验
-    #[account(mut)]
-    pub position_nft_account: UncheckedAccount<'info>,
-    pub personal_position: Box<Account<'info, PersonalPositionState>>,
-    #[account(
-        mut,
-        seeds = [
-        POSITION_SEED.as_bytes(),
-        pool_state.key().as_ref(),
-        &tick_array_lower.load()?.start_tick_index.to_be_bytes(),
-        &tick_array_upper.load()?.start_tick_index.to_be_bytes(),
-        ],
-        seeds::program = clmm_program,
-        bump,
-        constraint = protocol_position.pool_id == pool_state.key(),
-    )]
-    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
-    #[account(mut)]
-    pub tick_array_lower: AccountLoader<'info, TickArrayState>,
-    #[account(mut)]
-    pub tick_array_upper: AccountLoader<'info, TickArrayState>,
-
-    // ---------- 领取目标（必须为 user 的 ATA，且 mint=池子 token0/1 中的 USDC 那侧） ----------
-    #[account(
-        mut,
-        constraint = recipient_token_account.owner == user.key() @ OperationError::Unauthorized
-    )]
-    pub recipient_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     /// CHECK: spl-memo
     #[account(address = spl_memo::id())]
@@ -1268,114 +1221,33 @@ pub struct ClaimParams {
     pub min_usdc_out: u64, // required
 }
 
-
 #[derive(Accounts)]
 #[instruction(transfer_id: String)]
 pub struct Execute<'info> {
-    // 基于 transfer_id 的 OperationData（PDA 即 vault authority / signer）
     #[account(
         mut,
-        seeds = [b"operation_data", &transfer_id_hash_bytes(&transfer_id)],
+        seeds = [
+        b"operation_data".as_ref(),
+        transfer_id_hash_bytes(&transfer_id).as_ref(),
+        ],
         bump
     )]
     pub operation_data: Box<Account<'info, OperationData>>,
 
-    /// 程序名下托管账户（资金先前由 deposit_v2 存入），owner 必须是 operation_data
-    #[account(mut)]
-    pub program_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    /// 仅用于“实际收到 < 期望”时退款
-    #[account(mut)]
-    pub recipient_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    // --- 用户签名者（作为仓位 NFT 的 owner） ---
+    // 用户作为 position NFT 的所有者和 payer
     #[account(mut)]
     pub user: Signer<'info>,
 
-    // --- 程序名下两侧 token 账户（与池子 mint 一一对应，owner=operation_data） ---
-    #[account(
-        mut,
-        constraint = input_token_account.mint == input_vault_mint.key(),
-        constraint = input_token_account.owner == operation_data.key()
-    )]
-    pub input_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(
-        mut,
-        constraint = output_token_account.mint == output_vault_mint.key(),
-        constraint = output_token_account.owner == operation_data.key()
-    )]
-    pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    /// CHECK: position_nft_mint（用 user+pool_state 作种子）
-    #[account(
-        mut,
-        seeds = [b"pos_nft_mint", user.key().as_ref(), pool_state.key().as_ref()],
-        bump
-    )]
-    pub position_nft_mint: UncheckedAccount<'info>,
-    /// CHECK:
-    #[account(mut)]
-    pub position_nft_account: UncheckedAccount<'info>,
-
-    // --- Raydium 池 & 配置 ---
-    #[account(address = pool_state.load()?.amm_config)]
-    pub amm_config: Box<Account<'info, AmmConfig>>,
-    #[account(mut)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-
-    /// 池子金库（两侧）
-    #[account(mut, address = pool_state.load()?.token_vault_0)]
-    pub input_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = pool_state.load()?.token_vault_1)]
-    pub output_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    /// 价格观测账户
-    #[account(mut, address = pool_state.load()?.observation_key)]
-    pub observation_state: AccountLoader<'info, ObservationState>,
-
-    /// 两侧 mint
-    #[account(address = pool_state.load()?.token_mint_0)]
-    pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = pool_state.load()?.token_mint_1)]
-    pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-
-    /// CHECK: spl-memo
+    // 程序/系统
     #[account(address = spl_memo::id())]
     pub memo_program: UncheckedAccount<'info>,
-
-    /// Raydium CLMM 程序
-    #[account(constraint = clmm_program.key() == RAYDIUM_CLMM_PROGRAM_ID)]
+    #[account(constraint = clmm_program.key() == operation_data.clmm_program_id)]
     pub clmm_program: Program<'info, AmmV3>,
-
-    // --- Position（运行时校验，不再依赖 bounds） ---
-    /// CHECK: 运行时派生并 require! 校验
-    #[account(mut)]
-    pub protocol_position: UncheckedAccount<'info>,
-    pub personal_position: Box<Account<'info, PersonalPositionState>>,
-
-    pub rent: Sysvar<'info, Rent>,
-
-    // --- TickArray（运行时校验） ---
-    #[account(mut)]
-    pub tick_array_lower: AccountLoader<'info, TickArrayState>,
-    #[account(mut)]
-    pub tick_array_upper: AccountLoader<'info, TickArrayState>,
-
-    // --- OpenPositionV2 需要的 token 占位账户 ---
-    #[account(mut, constraint = token_account_0.mint == input_vault.mint)]
-    pub token_account_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, constraint = token_account_1.mint == output_vault.mint)]
-    pub token_account_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    /// CHECK:
-    #[account(mut)]
-    pub metadata_account: UncheckedAccount<'info>,
-    pub metadata_program: Program<'info, Metadata>,
-
     pub associated_token_program: Program<'info, AssociatedToken>,
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
 }
 
 #[derive(Accounts)]
@@ -1384,7 +1256,10 @@ pub struct ZapOutExecute<'info> {
     // 程序 PDA（vault authority），transfer_id 维度
     #[account(
         mut,
-        seeds = [b"operation_data", &transfer_id_hash_bytes(&transfer_id)],
+        seeds = [
+        b"operation_data".as_ref(),
+        transfer_id_hash_bytes(&transfer_id).as_ref(),
+        ],
         bump
     )]
     pub operation_data: Box<Account<'info, OperationData>>,
@@ -1396,55 +1271,6 @@ pub struct ZapOutExecute<'info> {
     // ====== Position / Pool / Raydium 帐户 ======
     /// CHECK: 仅作转发给 Raydium 的 nft_owner（不要求签名）
     pub user: UncheckedAccount<'info>,
-    /// CHECK:
-    #[account(mut)]
-    pub position_nft_mint: UncheckedAccount<'info>,
-    /// CHECK:
-    #[account(mut)]
-    pub position_nft_account: UncheckedAccount<'info>,
-
-    #[account(mut)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-    #[account(address = pool_state.load()?.amm_config)]
-    pub amm_config: Box<Account<'info, AmmConfig>>,
-
-    // PDA 名下两侧 token 账户（作为赎回与单边换的资金承接账户）
-    #[account(
-        mut,
-        constraint = input_token_account.mint == input_vault_mint.key(),
-        constraint = input_token_account.owner == operation_data.key()
-    )]
-    pub input_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(
-        mut,
-        constraint = output_token_account.mint == output_vault_mint.key(),
-        constraint = output_token_account.owner == operation_data.key()
-    )]
-    pub output_token_account: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-
-    // 池金库 & 观测
-    #[account(mut, address = pool_state.load()?.token_vault_0)]
-    pub input_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = pool_state.load()?.token_vault_1)]
-    pub output_vault: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = pool_state.load()?.observation_key)]
-    pub observation_state: AccountLoader<'info, ObservationState>,
-
-    // 两侧 mint（只读一致性）
-    #[account(address = pool_state.load()?.token_mint_0)]
-    pub input_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = pool_state.load()?.token_mint_1)]
-    pub output_vault_mint: Box<InterfaceAccount<'info, InterfaceMint>>,
-
-    // Raydium Position（协议/个人）——去掉基于 bounds 的 seeds，改运行时校验
-    /// CHECK: 运行时派生并 require! 校验
-    #[account(mut)]
-    pub protocol_position: UncheckedAccount<'info>,
-    pub personal_position: Box<Account<'info, PersonalPositionState>>,
-    #[account(mut)]
-    pub tick_array_lower: AccountLoader<'info, TickArrayState>,
-    #[account(mut)]
-    pub tick_array_upper: AccountLoader<'info, TickArrayState>,
 
     /// CHECK: spl-memo
     #[account(address = spl_memo::id())]
@@ -1495,6 +1321,25 @@ pub struct OperationData {
     pub amount: u64,
     pub executed: bool,
     pub ca: Pubkey, // contract address
+
+    // ===== Raydium CLMM & 池静态信息（deposit 时落库） =====
+    pub clmm_program_id: Pubkey,   // 冗余存储，便于 seeds::program 校验
+    pub pool_state: Pubkey,
+    pub amm_config: Pubkey,
+    pub observation_state: Pubkey,
+    pub token_vault_0: Pubkey,
+    pub token_vault_1: Pubkey,
+    pub token_mint_0: Pubkey,
+    pub token_mint_1: Pubkey,
+
+    // ===== ZapIn/Position 相关 =====
+    pub tick_lower: i32,
+    pub tick_upper: i32,
+    pub tick_array_lower: Pubkey,
+    pub tick_array_upper: Pubkey,
+    pub protocol_position: Pubkey,
+    pub personal_position: Pubkey,
+    pub position_nft_mint: Pubkey,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone, PartialEq, Eq, Debug)]
@@ -1526,15 +1371,23 @@ pub struct ZapInParams {
 
 impl OperationData {
     pub const LEN: usize =
-        32 + // authority
-            1 +  // initialized
-            4 + 64 + // transfer_id (prefix + max size)
-            32 + // recipient pubkey
-            1 +  // operation_type (enum discriminator)
-            4 + 256 + // action vec<u8> (prefix + max size)
-            8 +  // amount
-            1 +    // executed
-            32;  // CA
+        32 + 1 + (4 + 64) + 32 + 1 + (4 + 256) + 8 + 1 + 32
+            // 新字段（Raydium 固定 8 * Pubkey + ticks + 3 * Pubkey）
+            + 32 // clmm_program_id
+            + 32 // pool_state
+            + 32 // amm_config
+            + 32 // observation_state
+            + 32 // token_vault_0
+            + 32 // token_vault_1
+            + 32 // token_mint_0
+            + 32 // token_mint_1
+            + 4  // tick_lower (i32)
+            + 4  // tick_upper (i32)
+            + 32 // tick_array_lower
+            + 32 // tick_array_upper
+            + 32 // protocol_position
+            + 32 // personal_position
+            + 32 ; // position_nft_mint
 
 }
 
