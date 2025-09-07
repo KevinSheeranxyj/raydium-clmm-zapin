@@ -5,11 +5,13 @@ use anchor_spl::token_interface::{Token2022, Mint as InterfaceMint, TokenAccount
 use anchor_spl::metadata::Metadata;
 use anchor_lang::prelude::Rent;
 use anchor_spl::memo::spl_memo;
+use anchor_lang::system_program;
 use anchor_lang::prelude::Sysvar;
 use anchor_lang::error::Error;
 use raydium_amm_v3::libraries::{big_num::*, full_math::MulDiv, tick_math};
 use anchor_spl::associated_token::AssociatedToken;
 use std::str::FromStr;
+use anchor_lang::solana_program::sysvar;
 use raydium_amm_v3::{
     cpi,
     program::AmmV3,
@@ -177,7 +179,7 @@ pub mod dg_solana_zapin {
             protocol_pos_key, ca_mint,
             amount_total,
             mut pos_mint, personal_pos_stored,
-            action_bytes, pool_key_for_pos_mint
+            action_bytes, pool_key_for_pos_mint,
         ) = {
             let od = &ctx.accounts.operation_data;
             (
@@ -190,6 +192,9 @@ pub mod dg_solana_zapin {
                 od.action.clone(), od.pool_state,
             )
         };
+        let clmm_pid = { let od = &ctx.accounts.operation_data; od.clmm_program_id };
+        let user_key = ctx.accounts.user.key();
+        let od_key   = ctx.accounts.operation_data.key();
 
         // signer seeds
         let bump = ctx.bumps.operation_data;
@@ -199,6 +204,16 @@ pub mod dg_solana_zapin {
 
         // 关键：不要 clone / to_vec；直接用同一 'info 的切片
         let ras = ctx.remaining_accounts;
+
+        let clmm_prog_ai   = find_acc(ras, &clmm_pid,              "clmm_program")?;      // od.clmm_program_id
+        let token_prog_ai  = find_acc(ras, &token::ID,             "token_program")?;
+        let token22_prog_ai= find_acc(ras, &Token2022::id(),       "token_program_2022")?;
+        let memo_prog_ai   = find_acc(ras, &spl_memo::id(),        "memo_program")?;
+        let system_prog_ai = find_acc(ras, &system_program::ID,    "system_program")?;
+        let rent_sysvar_ai = find_acc(ras, &sysvar::rent::id(),    "rent_sysvar")?;
+        let user_ai        = find_acc(ras, &user_key, "user")?;
+        let operation_ai = find_acc(ras, &od_key, "operation_data_pda")?;
+
 
         // pool/config/observation + vaults + mints
         let pool_state        = find_acc(ras, &pool_state_key,        "pool_state")?;
@@ -215,8 +230,8 @@ pub mod dg_solana_zapin {
         let protocol_pos      = find_acc(ras, &protocol_pos_key,      "protocol_position")?;
 
         // PDA-owned input/output token accounts (mint0/mint1)
-        let pda_input_ata     = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &mint0_key, "pda_input_token_account")?;
-        let pda_output_ata    = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &mint1_key, "pda_output_token_account")?;
+        let pda_input_ata     = find_pda_token_by_mint(ras, &od_key, &mint0_key, "pda_input_token_account")?;
+        let pda_output_ata    = find_pda_token_by_mint(ras, &od_key, &mint1_key, "pda_output_token_account")?;
 
         // program_token_account (the deposit was made here; owner = operation_data PDA)
         let program_token_account = {
@@ -224,7 +239,7 @@ pub mod dg_solana_zapin {
                 let Ok(data_ref) = ai.try_borrow_data() else { return false; };
                 if data_ref.len() < spl_token::state::Account::LEN { return false; }
                 if let Ok(acc) = spl_token::state::Account::unpack_from_slice(&data_ref) {
-                    acc.owner == ctx.accounts.operation_data.key() && (acc.mint == mint0_key || acc.mint == mint1_key)
+                    acc.owner == od_key && (acc.mint == mint0_key || acc.mint == mint1_key)
                 } else {
                     false
                 }
@@ -238,7 +253,7 @@ pub mod dg_solana_zapin {
             .mint;
         let recipient_refund_ata = find_user_token_by_mint(
             ras,
-            &ctx.accounts.user.key(),
+            &user_key,
             &program_token_mint,
             "recipient_refund_ata",
         )?;
@@ -246,7 +261,7 @@ pub mod dg_solana_zapin {
         // ---- position NFT mint (PDA of *this* program) & user NFT ATA ----
         if pos_mint == Pubkey::default() {
             let (m, _) = Pubkey::find_program_address(
-                &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_key_for_pos_mint.as_ref()],
+                &[b"pos_nft_mint", user_key.as_ref(), pool_key_for_pos_mint.as_ref()],
                 ctx.program_id,
             );
             pos_mint = m;
@@ -255,7 +270,7 @@ pub mod dg_solana_zapin {
 
         // user ATA for position NFT
         let pos_nft_ata_key = anchor_spl::associated_token::get_associated_token_address_with_program_id(
-            &ctx.accounts.user.key(),
+            &user_key,
             &pos_mint,
             &anchor_spl::token::ID,
         );
@@ -330,10 +345,10 @@ pub mod dg_solana_zapin {
             let refund_cpi = Transfer {
                 from:      program_token_account.clone(),
                 to:        recipient_refund_ata.clone(),
-                authority: ctx.accounts.operation_data.to_account_info(),
+                authority: operation_ai.clone(),
             };
             token::transfer(
-                CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), refund_cpi, signer_seeds),
+                CpiContext::new_with_signer(token_prog_ai.clone(), refund_cpi, signer_seeds),
                 amount_total,
             )?;
             ctx.accounts.operation_data.executed = true;
@@ -363,10 +378,10 @@ pub mod dg_solana_zapin {
         let move_cpi = Transfer {
             from:      program_token_account.clone(),
             to:        to_acc,
-            authority: ctx.accounts.operation_data.to_account_info(),
+            authority: operation_ai.clone(),
         };
         token::transfer(
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), move_cpi, signer_seeds),
+            CpiContext::new_with_signer(token_prog_ai.clone(), move_cpi, signer_seeds),
             amount_total,
         )?;
 
@@ -383,7 +398,7 @@ pub mod dg_solana_zapin {
             };
 
             let swap_accounts = cpi::accounts::SwapSingleV2 {
-                payer:                 ctx.accounts.operation_data.to_account_info(),
+                payer:                 operation_ai.clone(),
                 amm_config:            amm_config.clone(),
                 pool_state:            pool_state.clone(),
                 input_token_account:   in_acc,
@@ -391,13 +406,13 @@ pub mod dg_solana_zapin {
                 input_vault:           in_vault,
                 output_vault:          out_vault,
                 observation_state:     observation.clone(),
-                token_program:         ctx.accounts.token_program.to_account_info(),
-                token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
-                memo_program:          ctx.accounts.memo_program.to_account_info(),
+                token_program:         token_prog_ai.clone(),
+                token_program_2022:    token22_prog_ai.clone(),
+                memo_program:          memo_prog_ai.clone(),
                 input_vault_mint:      in_mint,
                 output_vault_mint:     out_mint,
             };
-            let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts)
+            let swap_ctx = CpiContext::new(clmm_prog_ai.clone(), swap_accounts)
                 .with_signer(signer_seeds);
             cpi::swap_v2(
                 swap_ctx,
@@ -421,7 +436,7 @@ pub mod dg_solana_zapin {
             let rent_lamports = Rent::get()?.minimum_balance(mint_space);
 
             let create_ix = system_instruction::create_account(
-                &ctx.accounts.user.key(),
+                &user_key,
                 &pos_mint,
                 rent_lamports,
                 mint_space as u64,
@@ -430,23 +445,23 @@ pub mod dg_solana_zapin {
 
             // 为 pos_nft_mint PDA 计算 bump
             let (_pk, bump) = Pubkey::find_program_address(
-                &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_key_for_pos_mint.as_ref()],
+                &[b"pos_nft_mint", user_key.as_ref(), pool_key_for_pos_mint.as_ref()],
                 ctx.program_id,
             );
             let bump_bytes = [bump];
 
             let seeds: &[&[u8]] = &[
                 b"pos_nft_mint",
-                ctx.accounts.user.key.as_ref(),
+                user_key.as_ref(),
                 pool_key_for_pos_mint.as_ref(),
                 &bump_bytes,
             ];
             invoke_signed(
                 &create_ix,
                 &[
-                    ctx.accounts.user.to_account_info(),
+                    user_ai.clone(),
                     position_nft_mint_ai.clone(),
-                    ctx.accounts.system_program.to_account_info(),
+                    system_prog_ai.clone(),
                 ],
                 &[seeds],
             )?;
@@ -455,28 +470,28 @@ pub mod dg_solana_zapin {
         // ---------- open position (mint NFT) ----------
         {
             let open_accounts = cpi::accounts::OpenPositionV2 {
-                payer:                   ctx.accounts.operation_data.to_account_info(),
+                payer:                   operation_ai.clone(),
                 pool_state:              pool_state.clone(),
-                position_nft_owner:      ctx.accounts.user.to_account_info(),
+                position_nft_owner:      user_ai.clone(),
                 position_nft_mint:       position_nft_mint_ai.clone(),
                 position_nft_account:    position_nft_account.clone(),
                 personal_position:       personal_position.clone(),
                 protocol_position:       protocol_pos.clone(),
                 tick_array_lower:        ta_lower.clone(),
                 tick_array_upper:        ta_upper.clone(),
-                token_program:           ctx.accounts.token_program.to_account_info(),
-                system_program:          ctx.accounts.system_program.to_account_info(),
-                rent:                    ctx.accounts.rent.to_account_info(),
-                associated_token_program:ctx.accounts.associated_token_program.to_account_info(),
+                token_program:           token_prog_ai.clone(),
+                system_program:          system_prog_ai.clone(),
+                rent:                    rent_sysvar_ai.clone(),
+                associated_token_program: find_acc(ras, &anchor_spl::associated_token::ID, "associated_token_program")?,
                 token_account_0:         pda_input_ata.clone(),
                 token_account_1:         pda_output_ata.clone(),
                 token_vault_0:           vault0.clone(),
                 token_vault_1:           vault1.clone(),
                 vault_0_mint:           mint0.clone(),
                 vault_1_mint:           mint1.clone(),
-                metadata_program:       ctx.accounts.memo_program.to_account_info(),
+                metadata_program:       memo_prog_ai.clone(),
                 metadata_account:       position_nft_account.clone(),
-                token_program_2022:     ctx.accounts.token_program_2022.to_account_info(),
+                token_program_2022:     token22_prog_ai.clone(),
             };
 
             let pool = pool_state_data;
@@ -484,7 +499,7 @@ pub mod dg_solana_zapin {
             let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
             let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
 
-            let open_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), open_accounts)
+            let open_ctx = CpiContext::new(clmm_prog_ai.clone(), open_accounts)
                 .with_signer(signer_seeds);
 
             cpi::open_position_v2(
@@ -506,7 +521,7 @@ pub mod dg_solana_zapin {
             let (amount_0_max, amount_1_max) = if is_base_input { (remaining, received) } else { (received, remaining) };
 
             let inc_accounts = cpi::accounts::IncreaseLiquidityV2 {
-                nft_owner:               ctx.accounts.user.to_account_info(),
+                nft_owner:               user_ai.clone(),
                 nft_account:             position_nft_account.clone(),
                 pool_state:              pool_state.clone(),
                 protocol_position:       protocol_pos.clone(),
@@ -517,12 +532,12 @@ pub mod dg_solana_zapin {
                 token_account_1:         pda_output_ata.clone(),
                 token_vault_0:           vault0.clone(),
                 token_vault_1:           vault1.clone(),
-                token_program:           ctx.accounts.token_program.to_account_info(),
-                token_program_2022:      ctx.accounts.token_program_2022.to_account_info(),
+                token_program:           token_prog_ai.clone(),
+                token_program_2022:      token22_prog_ai.clone(),
                 vault_0_mint:            mint0.clone(),
                 vault_1_mint:            mint1.clone(),
             };
-            let inc_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), inc_accounts)
+            let inc_ctx = CpiContext::new(clmm_prog_ai, inc_accounts)
                 .with_signer(signer_seeds);
             cpi::increase_liquidity_v2(
                 inc_ctx,
@@ -552,7 +567,7 @@ pub mod dg_solana_zapin {
 
     pub fn claim(ctx: Context<Claim>, transfer_id: String, p: ClaimParams) -> Result<()> {
         // ---- 先拷 key，立刻结束对 od 的借用 ----
-        let (operation_ai, pool_state_key, amm_config_key, observation_key,
+        let (operation_key, pool_state_key, amm_config_key, observation_key,
             token_vault_0_key, token_vault_1_key, token_mint_0_key, token_mint_1_key,
             tick_array_lower_key, tick_array_upper_key, protocol_position_key, personal_position_key,
             position_nft_mint_key_opt)
@@ -561,16 +576,26 @@ pub mod dg_solana_zapin {
             require!(od.initialized, OperationError::NotInitialized);
             require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
             (
-                od.to_account_info(),
+                od.key(),
                 od.pool_state, od.amm_config, od.observation_state,
                 od.token_vault_0, od.token_vault_1, od.token_mint_0, od.token_mint_1,
                 od.tick_array_lower, od.tick_array_upper, od.protocol_position, od.personal_position,
                 if od.position_nft_mint != Pubkey::default() { Some(od.position_nft_mint) } else { None },
             )
         };
+        let user_key = ctx.accounts.user.key();
+        let od_key   = ctx.accounts.operation_data.key();
+        let clmm_pid = { let od = &ctx.accounts.operation_data; od.clmm_program_id };
 
         // 不复制 remaining_accounts，直接借用
         let ras = ctx.remaining_accounts;
+
+        let clmm_prog_ai    = find_acc(ras, &clmm_pid, "clmm_program")?;
+        let token_prog_ai   = find_acc(ras, &token::ID, "token_program")?;
+        let token22_prog_ai = find_acc(ras, &Token2022::id(), "token_program_2022")?;
+        let memo_prog_ai    = find_acc(ras, &spl_memo::id(), "memo_program")?;
+        let user_ai         = find_acc(ras, &user_key, "user")?;
+
 
         // ---- 从 remaining_accounts 抓取所有 Raydium / Vault / Mint / Position 账户 ----
         let pool_state          = find_acc(ras, &pool_state_key,        "pool_state")?;
@@ -584,20 +609,21 @@ pub mod dg_solana_zapin {
         let tick_array_upper_ai = find_acc(ras, &tick_array_upper_key,  "tick_array_upper")?;
         let protocol_position   = find_acc(ras, &protocol_position_key, "protocol_position")?;
         let personal_position   = find_acc(ras, &personal_position_key, "personal_position")?;
+        let operation_ai = find_acc(ras, &od_key, "operation_data_pda")?;
 
-        let input_token_account  = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &token_mint_0_key, "input_token_account")?;
-        let output_token_account = find_pda_token_by_mint(ras, &ctx.accounts.operation_data.key(), &token_mint_1_key, "output_token_account")?;
+        let input_token_account  = find_pda_token_by_mint(ras, &operation_key, &token_mint_0_key, "input_token_account")?;
+        let output_token_account = find_pda_token_by_mint(ras, &operation_key, &token_mint_1_key, "output_token_account")?;
 
         // ---- 计算/获取 position NFT mint & ATA ----
         let pos_mint = position_nft_mint_key_opt.unwrap_or_else(|| {
             let (m, _) = Pubkey::find_program_address(
-                &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_state_key.as_ref()],
-                &ctx.accounts.operation_data.clmm_program_id,
+                &[b"pos_nft_mint", user_key.as_ref(), pool_state_key.as_ref()],
+                ctx.program_id,
             );
             m
         });
         let position_nft_account_key = get_associated_token_address_with_program_id(
-            &ctx.accounts.user.key(), &pos_mint, &anchor_spl::token::ID,
+            &user_key, &pos_mint, &anchor_spl::token::ID,
         );
         let position_nft_account_ai = find_acc(ras, &position_nft_account_key, "position_nft_account(user ATA of position NFT)")?;
 
@@ -605,15 +631,15 @@ pub mod dg_solana_zapin {
         {
             let nft_acc = spl_token::state::Account::unpack(&position_nft_account_ai.try_borrow_data()?)
                 .map_err(|_| error!(OperationError::InvalidParams))?;
-            require!(nft_acc.owner == ctx.accounts.user.key(), OperationError::Unauthorized);
+            require!(nft_acc.owner == user_key, OperationError::Unauthorized);
             require!(nft_acc.mint == pos_mint,                  OperationError::Unauthorized);
             require!(nft_acc.amount == 1,                       OperationError::Unauthorized);
         }
 
         // ---- 领取 USDC 的 ATA（从 remaining_accounts 里）----
         let recipient_token_account =
-            find_user_token_by_mint(ras, &ctx.accounts.user.key(), &token_mint_0_key, "recipient_token_account(token_mint_0)")
-                .or_else(|_| find_user_token_by_mint(ras, &ctx.accounts.user.key(), &token_mint_1_key, "recipient_token_account(token_mint_1)"))?;
+            find_user_token_by_mint(ras, &user_key, &token_mint_0_key, "recipient_token_account(token_mint_0)")
+                .or_else(|_| find_user_token_by_mint(ras, &user_key, &token_mint_1_key, "recipient_token_account(token_mint_1)"))?;
         let usdc_mint = {
             let acc = spl_token::state::Account::unpack(&recipient_token_account.try_borrow_data()?)
                 .map_err(|_| error!(OperationError::InvalidParams))?;
@@ -635,7 +661,7 @@ pub mod dg_solana_zapin {
         // 1) 只结算手续费（liquidity=0）
         {
             let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
-                nft_owner:                 ctx.accounts.user.to_account_info(),
+                nft_owner:                 user_ai.clone(),
                 nft_account:               position_nft_account_ai.clone(),
                 pool_state:                pool_state.clone(),
                 protocol_position:         protocol_position.clone(),
@@ -646,13 +672,13 @@ pub mod dg_solana_zapin {
                 recipient_token_account_1: output_token_account.clone(),
                 token_vault_0:             token_vault_0.clone(),
                 token_vault_1:             token_vault_1.clone(),
-                token_program:             ctx.accounts.token_program.to_account_info(),
-                token_program_2022:        ctx.accounts.token_program_2022.to_account_info(),
+                token_program:             token_prog_ai.clone(),
+                token_program_2022:        token22_prog_ai.clone(),
                 vault_0_mint:              token_mint_0.clone(),
                 vault_1_mint:              token_mint_1.clone(),
-                memo_program:              ctx.accounts.memo_program.to_account_info(),
+                memo_program:              memo_prog_ai.clone(),
             };
-            let dec_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), dec_accounts).with_signer(signer_seeds);
+            let dec_ctx = CpiContext::new(clmm_prog_ai.clone(), dec_accounts).with_signer(signer_seeds);
             cpi::decrease_liquidity_v2(dec_ctx, 0u128, 0u64, 0u64)?;
         }
 
@@ -682,6 +708,7 @@ pub mod dg_solana_zapin {
                      true, got0)
                 };
 
+
             let swap_accounts = cpi::accounts::SwapSingleV2 {
                 payer:                 operation_ai.clone(),
                 amm_config:            amm_config.clone(),
@@ -691,13 +718,13 @@ pub mod dg_solana_zapin {
                 input_vault:           in_vault,
                 output_vault:          out_vault,
                 observation_state:     observation_state.clone(),
-                token_program:         ctx.accounts.token_program.to_account_info(),
-                token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
-                memo_program:          ctx.accounts.memo_program.to_account_info(),
+                token_program:         token_prog_ai.clone(),
+                token_program_2022:    token22_prog_ai.clone(),
+                memo_program:          memo_prog_ai.clone(),
                 input_vault_mint:      in_mint,
                 output_vault_mint:     out_mint,
             };
-            let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts).with_signer(signer_seeds);
+            let swap_ctx = CpiContext::new(clmm_prog_ai.clone(), swap_accounts).with_signer(signer_seeds);
             cpi::swap_v2(swap_ctx, amount_in, 0, 0, is_base_input)?;
 
             // 刷新 USDC 余额
@@ -719,14 +746,14 @@ pub mod dg_solana_zapin {
         let transfer_accounts = Transfer {
             from:      transfer_from,
             to:        recipient_token_account.clone(),
-            authority: operation_ai,
+            authority: operation_ai.clone(),
         };
-        let token_ctx = CpiContext::new(ctx.accounts.token_program.to_account_info(), transfer_accounts).with_signer(signer_seeds);
+        let token_ctx = CpiContext::new(token_prog_ai.clone(), transfer_accounts).with_signer(signer_seeds);
         token::transfer(token_ctx, total_usdc_after_swap)?;
 
         emit!(ClaimEvent {
             pool: pool_state_key,
-            beneficiary: ctx.accounts.user.key(),
+            beneficiary: user_key,
             mint: usdc_mint,
             amount: total_usdc_after_swap,
         });
@@ -740,7 +767,6 @@ pub mod dg_solana_zapin {
         _bounds: PositionBounds,
         p: ZapOutParams
     ) -> Result<()> {
-        // 读 od，拷 key，尽快结束借用
         let (operation_key, expected_recipient, pool_state_key, amm_config_key, observation_key,
             token_vault_0_key, token_vault_1_key, token_mint_0_key, token_mint_1_key,
             tick_array_lower_key, tick_array_upper_key, protocol_position_key, personal_position_key,
@@ -764,14 +790,23 @@ pub mod dg_solana_zapin {
             )
         };
 
+        let user_key = ctx.accounts.user.key();
+        let od_key   = ctx.accounts.operation_data.key();
+        let clmm_pid = { let od = &ctx.accounts.operation_data; od.clmm_program_id };
+
         // seeds
         let bump = ctx.bumps.operation_data;
         let h = transfer_id_hash_bytes(&transfer_id);
         let signer_seeds_slice: [&[u8]; 3] = [b"operation_data".as_ref(), h.as_ref(), &[bump]];
         let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
 
-        // 关键：不要复制，直接借用
         let ras = ctx.remaining_accounts;
+        let clmm_prog_ai    = find_acc(ras, &clmm_pid, "clmm_program")?;
+        let token_prog_ai   = find_acc(ras, &token::ID, "token_program")?;
+        let token22_prog_ai = find_acc(ras, &Token2022::id(), "token_program_2022")?;
+        let memo_prog_ai    = find_acc(ras, &spl_memo::id(), "memo_program")?;
+        let user_ai         = find_acc(ras, &user_key, "user")?;
+        let operation_ai = find_acc(ras, &od_key, "operation_data_pda")?;
 
         // ---- 从 remaining_accounts 抓所有账户 ----
         let pool_state          = find_acc(ras, &pool_state_key,        "pool_state")?;
@@ -788,9 +823,12 @@ pub mod dg_solana_zapin {
 
         let input_token_account  = find_pda_token_by_mint(ras, &operation_key, &token_mint_0_key, "input_token_account")?;
         let output_token_account = find_pda_token_by_mint(ras, &operation_key, &token_mint_1_key, "output_token_account")?;
+        let recipient_token_account =
+            find_user_token_by_mint(ras, &user_key, &token_mint_0_key, "recipient_token_account(token_mint_0)")
+                .or_else(|_| find_user_token_by_mint(ras, &user_key, &token_mint_1_key, "recipient_token_account(token_mint_1)"))?;
 
         // ---- 校验收款人 ATA ----
-        let rec_acc = ctx.accounts.recipient_token_account.to_account_info();
+        let rec_acc = recipient_token_account.clone();
         {
             let ta = spl_token::state::Account::unpack(&rec_acc.try_borrow_data()?)
                 .map_err(|_| error!(OperationError::InvalidParams))?;
@@ -835,13 +873,13 @@ pub mod dg_solana_zapin {
         let position_nft_account_ai = {
             let pos_mint = pos_mint_key_opt.unwrap_or_else(|| {
                 let (m, _) = Pubkey::find_program_address(
-                    &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_state_key.as_ref()],
-                    &ctx.accounts.operation_data.clmm_program_id,
+                    &[b"pos_nft_mint", user_key.as_ref(), pool_state_key.as_ref()],
+                    &this_program_id,
                 );
                 m
             });
             let ata = get_associated_token_address_with_program_id(
-                &ctx.accounts.user.key(),
+                &user_key,
                 &pos_mint,
                 &anchor_spl::token::ID,
             );
@@ -851,7 +889,7 @@ pub mod dg_solana_zapin {
         // ---------- A: 赎回 ----------
         {
             let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
-                nft_owner:                 ctx.accounts.user.to_account_info(),
+                nft_owner:                 user_ai.clone(),
                 nft_account:               position_nft_account_ai.clone(),
                 pool_state:                pool_state.clone(),
                 protocol_position:         protocol_position.clone(),
@@ -862,13 +900,13 @@ pub mod dg_solana_zapin {
                 recipient_token_account_1: output_token_account.clone(),
                 token_vault_0:             token_vault_0.clone(),
                 token_vault_1:             token_vault_1.clone(),
-                token_program:             ctx.accounts.token_program.to_account_info(),
-                token_program_2022:        ctx.accounts.token_program_2022.to_account_info(),
+                token_program:             token_prog_ai.clone(),
+                token_program_2022:        token22_prog_ai.clone(),
                 vault_0_mint:              token_mint_0.clone(),
                 vault_1_mint:              token_mint_1.clone(),
-                memo_program:              ctx.accounts.memo_program.to_account_info(),
+                memo_program:              memo_prog_ai.clone(),
             };
-            let dec_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), dec_accounts)
+            let dec_ctx = CpiContext::new(clmm_prog_ai.clone(), dec_accounts)
                 .with_signer(signer_seeds);
             cpi::decrease_liquidity_v2(dec_ctx, burn_liq, min0, min1)?;
         }
@@ -898,25 +936,27 @@ pub mod dg_solana_zapin {
                      token_mint_0.clone(), token_mint_1.clone())
                 };
 
-            let swap_accounts = cpi::accounts::SwapSingleV2 {
-                payer:                 ctx.accounts.operation_data.to_account_info(),
-                amm_config:            amm_config.clone(),
-                pool_state:            pool_state.clone(),
-                input_token_account:   in_acc,
-                output_token_account:  out_acc,
-                input_vault:           in_vault,
-                output_vault:          out_vault,
-                observation_state:     observation_state.clone(),
-                token_program:         ctx.accounts.token_program.to_account_info(),
-                token_program_2022:    ctx.accounts.token_program_2022.to_account_info(),
-                memo_program:          ctx.accounts.memo_program.to_account_info(),
-                input_vault_mint:      in_mint,
-                output_vault_mint:     out_mint,
-            };
-            let swap_ctx = CpiContext::new(ctx.accounts.clmm_program.to_account_info(), swap_accounts)
-                .with_signer(signer_seeds);
-            cpi::swap_v2(swap_ctx, swap_amount, 0, 0, is_base_input)?;
+            {
+                let swap_accounts = cpi::accounts::SwapSingleV2 {
+                    payer:                 operation_ai.clone(),
+                    amm_config:            amm_config.clone(),
+                    pool_state:            pool_state.clone(),
+                    input_token_account:   in_acc,
+                    output_token_account:  out_acc,
+                    input_vault:           in_vault,
+                    output_vault:          out_vault,
+                    observation_state:     observation_state.clone(),
+                    token_program:         token_prog_ai.clone(),
+                    token_program_2022:    token22_prog_ai.clone(),
+                    memo_program:          memo_prog_ai.clone(),
+                    input_vault_mint:      in_mint,
+                    output_vault_mint:     out_mint,
+                };
+                let swap_ctx = CpiContext::new(clmm_prog_ai.clone(), swap_accounts)
+                    .with_signer(signer_seeds);
+                cpi::swap_v2(swap_ctx, swap_amount, 0, 0, is_base_input)?;
 
+            }
             // 刷新单边后的总量
             total_out = if p.want_base {
                 load_token_amount(&input_token_account)?
@@ -935,10 +975,10 @@ pub mod dg_solana_zapin {
         let cpi_accounts = Transfer {
             from:      from_acc,
             to:        rec_acc.clone(),
-            authority: ctx.accounts.operation_data.to_account_info(),
+            authority: operation_ai.clone(),
         };
         token::transfer(
-            CpiContext::new_with_signer(ctx.accounts.token_program.to_account_info(), cpi_accounts, signer_seeds),
+            CpiContext::new_with_signer(token_prog_ai.clone(), cpi_accounts, signer_seeds),
             total_out,
         )?;
 
@@ -975,6 +1015,7 @@ fn find_acc<'info>(ras: &'info [AccountInfo<'info>], key: &Pubkey, label: &str) 
     })?;
     Ok(ai.clone()) // 关键：克隆成“拥有型”AccountInfo
 }
+
 fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
     let data = ai.try_borrow_data().ok()?;
     spl_token::state::Account::unpack_from_slice(&data).ok()
