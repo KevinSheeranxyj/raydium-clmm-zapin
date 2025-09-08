@@ -1,0 +1,16 @@
+{
+  "CLMM_PROGRAM_ID": "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+  "POOL_STATE": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "AMM_CONFIG": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "OBSERVATION_STATE": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "TOKEN_VAULT_0": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "TOKEN_VAULT_1": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "TOKEN_MINT_0": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "TOKEN_MINT_1": "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx",
+  "TICK_SPACING": 1,     // 对应该池的 tickSpacing（int）
+  "SQRT_PRICE_X64": "0",  // 该池当前 sqrt_price_x64，十进制字符串
+  "exampleTicks": {
+    "tickLower": -120,    // 任选一对含价位的 tick 边界（需 sp 处于 [sa,sb]）
+    "tickUpper":  120
+  }
+}
