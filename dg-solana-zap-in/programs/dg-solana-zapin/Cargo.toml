@@ -6,7 +6,7 @@ edition = "2021"
 
 [lib]
 crate-type = ["cdylib", "lib"]
-name = "dg_solana_programs"
+name = "dg_solana_zapin"
 
 [features]
 default = []

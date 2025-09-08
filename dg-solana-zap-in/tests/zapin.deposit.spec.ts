@@ -9,8 +9,7 @@ import {
 } from "./helpers/pdas";
 import { encodeZapInParams, OperationType } from "./helpers/params";
 
-// 载入 Raydium 池 fixture（请先填写 fixtures/raydium.json）
-const RAYDIUM = require("../fixtures/raydium.json");
+const RAYDIUM = require("./fixtures/raydium.json");
 
 describe("dg_solana_zapin :: deposit", () => {
     const provider = anchor.AnchorProvider.env();

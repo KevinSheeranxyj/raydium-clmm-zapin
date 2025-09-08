@@ -26,7 +26,7 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::token::spl_token;
 
-declare_id!("7dPr9v5vt7uD8zTs6NZocSm45uBH6ZESnCcdWwUqoLV");
+declare_id!("DgrQqeR5MTFkNNG94siEd5cDxdzgexSNwbv4FHdNW8f3");
 
 pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
     pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"); // mainnet program ID
@@ -647,14 +647,6 @@ pub mod dg_solana_zapin {
     }
 }
 
-// fn find_acc<'info>(ras: &'info [AccountInfo<'info>], key: &Pubkey, label: &str) -> Result<AccountInfo<'info>> {
-//     let ai = ras.iter().find(|ai| ai.key == key).ok_or_else(|| {
-//         msg!("missing account in remaining_accounts: {} = {}", label, key);
-//         error!(OperationError::InvalidParams)
-//     })?;
-//     Ok(ai.clone()) //
-// }
-
 fn find_acc_idx(ras: &[AccountInfo], key: &Pubkey, label: &str) -> Result<usize> {
     ras.iter()
         .position(|ai| *ai.key == *key)
@@ -783,7 +775,6 @@ pub struct Deposit<'info> {
         init_if_needed,
         payer = authority,
         space = 8 + Registry::LEN,
-        // single global registry PDA so the program can find/guard duplicates
         seeds = [b"registry"], bump
     )]
     pub registry: Account<'info, Registry>,
