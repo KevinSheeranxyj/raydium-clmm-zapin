@@ -26,10 +26,11 @@ use anchor_lang::solana_program::{
 };
 use anchor_spl::token::spl_token;
 
-declare_id!("DgrQqeR5MTFkNNG94siEd5cDxdzgexSNwbv4FHdNW8f3");
+declare_id!("HvaJVEKFL8UPJtPmCJ5JYQMYyjtArAhn2XKfswWtRJNU");
 
+// Devnet: DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH
 pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
-    pubkey!("CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK"); // mainnet program ID
+    pubkey!("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH"); // mainnet program ID
 
 /// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
 #[program]
@@ -39,18 +40,28 @@ pub mod dg_solana_zapin {
 
     // Initialize the PDA and set the authority
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        let operation_data = &mut ctx.accounts.operation_data;
-        operation_data.authority = ctx.accounts.authority.key();
-        operation_data.initialized = true;
-        msg!("Initialized PDA with authority: {}", operation_data.authority);
+        let od = &mut ctx.accounts.operation_data;
+        if !od.initialized {
+            od.authority = ctx.accounts.authority.key();
+            od.initialized = true;
+            msg!("Initialized PDA with authority: {}", od.authority);
+        } else {
+            msg!("PDA already initialized; authority: {}", od.authority);
+        }
         Ok(())
     }
 
     #[event]
     pub struct DepositEvent {
-        pub transfer_id: String,
+        pub transfer_id_hex: String,
         pub amount: u64,
         pub recipient: Pubkey,
+    }
+
+    #[event]
+    pub struct ExecutorAssigned {
+        pub transfer_id_hex: String,
+        pub executor: Pubkey,
     }
 
     #[event]
@@ -62,25 +73,26 @@ pub mod dg_solana_zapin {
     // Deposit transfer details into PDA
     pub fn deposit(
         ctx: Context<Deposit>,
-        transfer_id: String,
+        transfer_id: [u8; 32],
         operation_type: OperationType,
         action: Vec<u8>,
         amount: u64,
         ca: Pubkey,
+        authorized_executor: Pubkey,
     ) -> Result<()> {
         let od = &mut ctx.accounts.operation_data;
-
         // 初始化（首次该 transfer_id）
         if !od.initialized {
             od.authority = ctx.accounts.authority.key();
             od.initialized = true;
-            msg!("Initialized operation_data for transfer_id {} with authority {}", transfer_id, od.authority);
+            msg!("Initialized operation_data for transfer_id {} with authority {}", to_hex32(&transfer_id), od.authority);
         }
-        let id_hash = transfer_id_hash_bytes(&transfer_id);
+        let id_hash = transfer_id;
         let reg = &mut ctx.accounts.registry;
         require!(!reg.used_ids.contains(&id_hash), OperationError::DuplicateTransferId);
         reg.used_ids.push(id_hash);
 
+        require!(authorized_executor != Pubkey::default(), OperationError::InvalidParams);
         require!(amount > 0, OperationError::InvalidAmount);
         require!(!transfer_id.is_empty(), OperationError::InvalidTransferId);
 
@@ -101,8 +113,9 @@ pub mod dg_solana_zapin {
         od.ca = ca;
         od.operation_type = operation_type.clone();
         od.action = action.clone(); // 保留原始参数
-
+        od.executor = authorized_executor; // 授权执行人
         // ====== 存 Raydium 固定账户（直接从 ctx 读 pubkey）======
+        msg!("clmm_program_id: {}", ctx.accounts.clmm_program.key());
         od.clmm_program_id   = ctx.accounts.clmm_program.key();
         od.pool_state        = ctx.accounts.pool_state.key();
         od.amm_config        = ctx.accounts.amm_config.key();
@@ -166,17 +179,18 @@ pub mod dg_solana_zapin {
             od.recipient = p.recipient;
         }
 
-        emit!(DepositEvent { transfer_id, amount, recipient: od.recipient });
+        emit!(DepositEvent { transfer_id_hex: to_hex32(&transfer_id), amount, recipient: od.recipient });
+        emit!(ExecutorAssigned { transfer_id_hex: to_hex32(&transfer_id), executor: od.executor });
         Ok(())
     }
 
     // Execute the token transfer (ZapIn only)
-    pub fn execute(ctx: Context<Execute>, transfer_id: String) -> Result<()> {
-        let id_hash = transfer_id_hash_bytes(&transfer_id);
+    pub fn execute(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
+        let id_hash = transfer_id;
         require!(ctx.accounts.registry.used_ids.contains(&id_hash), OperationError::InvalidTransferId);
         // recompute expected PDA from the stored transfer_id
         let (expected_pda, _bump) = Pubkey::find_program_address(
-            &[b"operation_data", ctx.accounts.operation_data.transfer_id.as_bytes()],
+            &[b"operation_data", &transfer_id],
             ctx.program_id,
         );
         require!(expected_pda == ctx.accounts.operation_data.key(), OperationError::InvalidParams);
@@ -211,13 +225,19 @@ pub mod dg_solana_zapin {
                 od.action.clone(), od.pool_state,
             )
         };
+
+        require!(
+            ctx.accounts.user.key() == ctx.accounts.operation_data.executor,
+            OperationError::Unauthorized
+        );
+
         let clmm_pid = { let od = &ctx.accounts.operation_data; od.clmm_program_id };
         let user_key = ctx.accounts.user.key();
         let od_key   = ctx.accounts.operation_data.key();
 
         // signer seeds
         let bump = ctx.bumps.operation_data;
-        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data".as_ref(), transfer_id.as_bytes(), &[bump]];
+        let signer_seeds_slice: [&[u8]; 3] = [b"operation_data".as_ref(), &transfer_id, &[bump]];
         let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
         // signer seeds also use the stored transfer_id
         let mut personal_pos_key_maybe: Option<Pubkey> = None;
@@ -330,19 +350,21 @@ pub mod dg_solana_zapin {
             let position_nft_account = ras[find_idx(&pos_nft_ata_key, "position_nft_account(user ATA)")?].clone();
 
             // ---- personal_position（优先已存，否则猜测一个可反序列化的）----
-            let (personal_position, guessed) =
-                if personal_pos_stored != Pubkey::default() {
-                    (ras[find_idx(&personal_pos_stored, "personal_position")?].clone(), None)
-                } else {
-                    let guess_ref = ras
-                        .iter()
-                        .find(|ai| is_anchor_account::<raydium_amm_v3::states::PersonalPositionState>(ai))
-                        .ok_or_else(|| {
-                            msg!("missing personal_position in remaining_accounts");
-                            error!(OperationError::InvalidParams)
-                        })?;
-                    (guess_ref.clone(), Some(guess_ref.key()))
-                };
+            let (personal_position, guessed) = if personal_pos_stored != Pubkey::default() {
+                (ras[find_idx(&personal_pos_stored, "personal_position")?].clone(), None)
+            } else {
+                // Only consider accounts **owned by the CLMM program** and that safely deserialize
+                let guess_ref = ras.iter().find(|ai| {
+                    is_anchor_account_owned::<raydium_amm_v3::states::PersonalPositionState>(
+                        ai,
+                        &clmm_prog_ai.key(),
+                    )
+                }).ok_or_else(|| {
+                    msg!("missing/invalid personal_position in remaining_accounts");
+                    error!(OperationError::InvalidParams)
+                })?;
+                (guess_ref.clone(), Some(guess_ref.key()))
+            };
             personal_pos_key_maybe = guessed;
 
             // ---------- parse ZapIn params ----------
@@ -356,8 +378,13 @@ pub mod dg_solana_zapin {
             let is_base_input = program_token_mint == mint0_key;
 
             // ---------- price/fees ----------
-            let pool_state_data = raydium_amm_v3::states::PoolState::try_deserialize(&mut &pool_state.try_borrow_data()?[..])
-                .map_err(|_| error!(OperationError::InvalidParams))?;
+            require_keys_eq!(*pool_state.owner, clmm_prog_ai.key(), OperationError::InvalidParams);
+            require_keys_eq!(*amm_config.owner, clmm_prog_ai.key(), OperationError::InvalidParams);
+            require_keys_eq!(*observation.owner, clmm_prog_ai.key(), OperationError::InvalidParams);
+
+            let pool_state_data: raydium_amm_v3::states::PoolState =
+                try_deser_anchor_account(&pool_state, &clmm_prog_ai.key(), "pool_state")?;
+
             let sp = pool_state_data.sqrt_price_x64;
 
             let sp_u = U256::from(sp);
@@ -365,8 +392,9 @@ pub mod dg_solana_zapin {
             let price_q64 = sp_u.mul_div_floor(sp_u, q64_u).ok_or(error!(OperationError::InvalidParams))?;
 
             // amm_config fees
-            let cfg = raydium_amm_v3::states::AmmConfig::try_deserialize(&mut &amm_config.try_borrow_data()?[..])
-                .map_err(|_| error!(OperationError::InvalidParams))?;
+            let cfg: raydium_amm_v3::states::AmmConfig =
+                try_deser_anchor_account(&amm_config, &clmm_prog_ai.key(), "amm_config")?;
+
             let trade_fee_bps: u32 = cfg.trade_fee_rate.into();
             let protocol_fee_bps: u32 = cfg.protocol_fee_rate.into();
             let total_fee_bps = trade_fee_bps + protocol_fee_bps;
@@ -602,7 +630,7 @@ pub mod dg_solana_zapin {
                 )?;
 
                 emit!(LiquidityAdded {
-                    transfer_id: transfer_id.clone(),
+                    transfer_id: to_hex32(&transfer_id),
                     token0_used: (if is_base_input { post_in }  else { post_out }).saturating_sub(load_token_amount(&pda_input_ata)?),
                     token1_used: (if is_base_input { post_out } else { post_in  }).saturating_sub(load_token_amount(&pda_output_ata)?),
                 });
@@ -657,35 +685,82 @@ fn find_acc_idx(ras: &[AccountInfo], key: &Pubkey, label: &str) -> Result<usize>
 }
 
 fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
-    let data = ai.try_borrow_data().ok()?;
+    // Only SPL Token or Token-2022 accounts can be unpacked
+    if *ai.owner != token::ID && *ai.owner != anchor_spl::token_2022::ID {
+        return None;
+    }
+    let Ok(data) = ai.try_borrow_data() else { return None; };
+    if data.len() < spl_token::state::Account::LEN { return None; }
     spl_token::state::Account::unpack_from_slice(&data).ok()
 }
 
-
-fn try_deser_anchor_account<T: AccountDeserialize>(ai: &AccountInfo) -> Option<T> {
-    let data_ref = ai.try_borrow_data().ok()?;   // Ref<[u8]>
-    let mut bytes: &[u8] = &data_ref;            // &Ref<[u8]> -> &[u8]
-    T::try_deserialize(&mut bytes).ok()
-}
-
-/// 只检查某 AccountInfo 是否是某个 Anchor 类型（通过 try_deserialize 是否成功）
-fn is_anchor_account<T: AccountDeserialize>(ai: &AccountInfo) -> bool {
-    try_deser_anchor_account::<T>(ai).is_some()
-}
-
 fn load_token_amount(ai: &AccountInfo) -> Result<u64> {
-    let data = ai.try_borrow_data()?;
-    let acc = spl_token::state::Account::unpack_from_slice(&data)
-        .map_err(|_| error!(OperationError::InvalidParams))?;
+    let Some(acc) = unpack_token_account(ai) else {
+        msg!("not a valid SPL token account: {}", ai.key);
+        return err!(OperationError::InvalidParams);
+    };
     Ok(acc.amount)
 }
 
+fn try_deser_anchor_account<T: AccountDeserialize>(
+    ai: &AccountInfo,
+    expected_owner: &Pubkey,
+    label: &str,
+) -> Result<T> {
+    require_keys_eq!(*ai.owner, *expected_owner, OperationError::InvalidParams);
+    let Ok(data) = ai.try_borrow_data() else {
+        msg!("{}: borrow_data failed", label);
+        return err!(OperationError::InvalidParams);
+    };
+    require!(data.len() >= 8, OperationError::InvalidParams);
+    let mut bytes: &[u8] = &data;
+    T::try_deserialize(&mut bytes).map_err(|_| {
+        msg!("{}: anchor deserialize failed (wrong account type/len)", label);
+        error!(OperationError::InvalidParams)
+    })
+}
+
+/// True iff the account looks like `T` **and** is owned by `owner`.
+fn is_anchor_account_owned<T: AccountDeserialize>(
+    ai: &AccountInfo,
+    owner: &Pubkey,
+) -> bool {
+    if *ai.owner != *owner { return false; }
+    if let Ok(data) = ai.try_borrow_data() {
+        if data.len() < 8 { return false; }
+        let mut bytes: &[u8] = &data;
+        T::try_deserialize(&mut bytes).is_ok()
+    } else {
+        false
+    }
+}
+
+// fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
+//     let data = ai.try_borrow_data().ok()?;
+//     spl_token::state::Account::unpack_from_slice(&data).ok()
+// }
+
+
+// fn try_deser_anchor_account<T: AccountDeserialize>(ai: &AccountInfo) -> Option<T> {
+//     let data_ref = ai.try_borrow_data().ok()?;   // Ref<[u8]>
+//     let mut bytes: &[u8] = &data_ref;            // &Ref<[u8]> -> &[u8]
+//     T::try_deserialize(&mut bytes).ok()
+// }
+
+// /// 只检查某 AccountInfo 是否是某个 Anchor 类型（通过 try_deserialize 是否成功）
+// fn is_anchor_account<T: AccountDeserialize>(ai: &AccountInfo) -> bool {
+//     try_deser_anchor_account::<T>(ai).is_some()
+// }
+
+// fn load_token_amount(ai: &AccountInfo) -> Result<u64> {
+//     let data = ai.try_borrow_data()?;
+//     let acc = spl_token::state::Account::unpack_from_slice(&data)
+//         .map_err(|_| error!(OperationError::InvalidParams))?;
+//     Ok(acc.amount)
+// }
+
 const Q64_U128: u128 = 1u128 << 64;
 
-#[inline]
-fn transfer_id_hash_bytes(transfer_id: &str) -> [u8; 32] {
-    solana_hash(transfer_id.as_bytes()).to_bytes()
-}
 #[inline]
 fn amounts_from_liquidity_burn_q64(
     sa: u128,    // sqrt(P_lower) in Q64.64
@@ -725,6 +800,16 @@ fn amounts_from_liquidity_burn_q64(
     (amount0, amount1)
 }
 
+fn to_hex32(bytes: &[u8;32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = [0u8; 64];
+    for (i, b) in bytes.iter().enumerate() {
+        out[2*i]   = HEX[(b >> 4) as usize];
+        out[2*i+1] = HEX[(b & 0x0f) as usize];
+    }
+    String::from_utf8(out.to_vec()).unwrap()
+}
+
 const TICK_ARRAY_SIZE: i32 = 88; //Raydium/UniV3 每个 TickArray 覆盖 88 个 tick 间隔
 #[inline]
 fn tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
@@ -752,10 +837,11 @@ fn apply_slippage_min(amount: u64, slippage_bps: u32) -> u64 {
     (num / one) as u64
 }
 
+
 #[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
-        init,
+        init_if_needed,
         payer = authority,
         space = 8 + OperationData::LEN,
         seeds = [b"operation_data"],
@@ -769,7 +855,7 @@ pub struct Initialize<'info> {
 
 
 #[derive(Accounts)]
-#[instruction(transfer_id: String)]
+#[instruction(transfer_id: [u8; 32])]
 pub struct Deposit<'info> {
     #[account(
         init_if_needed,
@@ -785,7 +871,7 @@ pub struct Deposit<'info> {
         space = 8 + OperationData::LEN,
         seeds = [
         b"operation_data".as_ref(),
-        transfer_id.as_bytes()
+        &transfer_id
         ],
         bump
     )]
@@ -845,13 +931,13 @@ pub struct PositionBounds {
 
 
 #[derive(Accounts)]
-#[instruction(transfer_id: String)]
+#[instruction(transfer_id: [u8; 32])]
 pub struct Execute<'info> {
     #[account(
         mut,
         seeds = [
         b"operation_data".as_ref(),
-        transfer_id.as_bytes(),
+        &transfer_id,
         ],
         bump
     )]
@@ -882,9 +968,10 @@ pub struct Registry {
     pub used_ids: Vec<[u8; 32]>,
 }
 
-pub const REGISTRY_MAX_IDS: usize = 1024;
+pub const REGISTRY_MAX_IDS: usize = 128;
 impl Registry {
-    pub const LEN: usize = 4 /* vec len */ + REGISTRY_MAX_IDS * 32;
+    pub const START_CAP: usize = 32; // 32 IDs to start
+    pub const LEN: usize = 4 + Self::START_CAP * 32;
 
 }
 
@@ -908,14 +995,17 @@ pub struct ModifyPdaAuthority<'info> {
 #[derive(Default)]
 pub struct OperationData {
     pub authority: Pubkey,
+
     pub initialized: bool,
-    pub transfer_id: String,
+    pub transfer_id: [u8; 32],
     pub recipient: Pubkey,
     pub operation_type: OperationType,
     pub action: Vec<u8>, // Serialize operation-specific parameters
     pub amount: u64,
     pub executed: bool,
     pub ca: Pubkey, // contract address
+
+    pub executor: Pubkey, // 授权执行人，防止execute可以被任何人操作
 
     // ===== Raydium CLMM & 池静态信息（deposit 时落库） =====
     pub clmm_program_id: Pubkey,   // 冗余存储，便于 seeds::program 校验
@@ -966,24 +1056,19 @@ pub struct ZapInParams {
 
 impl OperationData {
     pub const LEN: usize =
-        32 + 1 + (4 + 64) + 32 + 1 + (4 + 256) + 8 + 1 + 32
-            // 新字段（Raydium 固定 8 * Pubkey + ticks + 3 * Pubkey）
-            + 32 // clmm_program_id
-            + 32 // pool_state
-            + 32 // amm_config
-            + 32 // observation_state
-            + 32 // token_vault_0
-            + 32 // token_vault_1
-            + 32 // token_mint_0
-            + 32 // token_mint_1
-            + 4  // tick_lower (i32)
-            + 4  // tick_upper (i32)
-            + 32 // tick_array_lower
-            + 32 // tick_array_upper
-            + 32 // protocol_position
-            + 32 // personal_position
-            + 32 ; // position_nft_mint
-
+        32                     // authority
+            + 1                      // initialized
+            + 32                     // transfer_id (replaces 4+64)
+            + 32                     // recipient
+            + 1                      // operation_type
+            + (4 + 256)              // action (cap)
+            + 8                      // amount
+            + 1                      // executed
+            + 32                     // ca
+            + 32                     // executor
+            + 32*8                   // clmm + pool fields
+            + 4 + 4                  // ticks
+            + 32*5;                  // tick arrays + positions + nft mint
 }
 
 #[error_code]
