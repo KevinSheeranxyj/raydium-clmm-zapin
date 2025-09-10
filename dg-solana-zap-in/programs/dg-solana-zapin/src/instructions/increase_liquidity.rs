@@ -1,20 +1,34 @@
+use anchor_lang::prelude::*;
 use anchor_lang::{Accounts, event, instruction, require};
-use anchor_lang::prelude::{Account, AccountLoader, Context, InterfaceAccount, Program, Signer, UncheckedAccount};
 use anchor_spl::token::{Token, TokenAccount};
 use anchor_spl::token_2022::Token2022;
-use crate::helpers::{do_increase_liquidity_v2, load_token_amount};
+use crate::helpers::{do_increase_liquidity_v2, load_token_amount, to_hex32};
 use crate::state::{ExecStage, OperationType};
+use crate::events::*;
+use anchor_lang::prelude::InterfaceAccount;
+use anchor_spl::token_interface::{Mint as InterfaceMint, TokenAccount as InterfaceTokenAccount};
+use crate::OperationData;
+use crate::errors::ErrorCode;
+use raydium_amm_v3::{
+    cpi,
+    program::AmmV3,
+    states::{PoolState, AmmConfig, POSITION_SEED, TICK_ARRAY_SEED, ObservationState, TickArrayState, ProtocolPositionState, PersonalPositionState},
+};
 
+
+/*
+    Add liquidity from an existing Raydium CLMM  Position.
+ */
 pub fn handler(ctx: Context<IncreaseLiquidity>, transfer_id: [u8;32]) -> Result<()> {
     let od = &mut ctx.accounts.operation_data;
 
     // 阶段&权限
-    require!(od.initialized, OperationError::NotInitialized);
-    require!(!od.executed, OperationError::AlreadyExecuted);
-    require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
-    require!(matches!(od.operation_type, OperationType::ZapIn), OperationError::InvalidParams);
-    require!(ctx.accounts.user.key() == od.executor, OperationError::Unauthorized);
-    require!(od.stage == ExecStage::Opened, OperationError::InvalidParams);
+    require!(od.initialized, ErrorCode::NotInitialized);
+    require!(!od.executed, ErrorCode::AlreadyExecuted);
+    require!(od.transfer_id == transfer_id, ErrorCode::InvalidTransferId);
+    require!(matches!(od.operation_type, OperationType::ZapIn), ErrorCode::InvalidParams);
+    require!(ctx.accounts.user.key() == od.executor, ErrorCode::Unauthorized);
+    require!(od.stage == ExecStage::Opened, ErrorCode::InvalidParams);
 
     // 读取 PDA 两侧余额作为 max（由 CPI 内部按需要消耗）
     let pre0 = load_token_amount(&ctx.accounts.pda_token0.to_account_info())?;
@@ -62,19 +76,12 @@ pub fn handler(ctx: Context<IncreaseLiquidity>, transfer_id: [u8;32]) -> Result<
 
 }
 
-#[event]
-pub struct LiquidityAdded {
-    pub transfer_id: String,
-    pub token0_used: u64,
-    pub token1_used: u64,
-}
-
 #[derive(Accounts)]
 #[instruction(transfer_id: [u8; 32])]
 pub struct IncreaseLiquidity<'info> {
     #[account(
         mut,
-        seeds = [b"operation_data", &transfer_id],
+        seeds = [b"operation_data".as_ref(), transfer_id.as_ref()],
         bump
     )]
     pub operation_data: Account<'info, OperationData>,
@@ -85,10 +92,12 @@ pub struct IncreaseLiquidity<'info> {
 
     #[account(mut, address = operation_data.pool_state)]
     pub pool_state: AccountLoader<'info, PoolState>,
+    /// CHECK:  operation_data.protocol_position is not a valid address
     #[account(mut, address = operation_data.protocol_position)]
-    pub protocol_position: AccountLoader<'info, ProtocolPositionState>,
+    pub protocol_position: UncheckedAccount<'info>,
     #[account(mut)]
-    pub personal_position: AccountLoader<'info, PersonalPositionState>,
+    /// CHECK:  operation_data.personal_position is not a valid address
+    pub personal_position: UncheckedAccount<'info>,
     #[account(mut, address = operation_data.tick_array_lower)]
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
     #[account(mut, address = operation_data.tick_array_upper)]
@@ -107,6 +116,7 @@ pub struct IncreaseLiquidity<'info> {
     #[account(address = operation_data.token_mint_1)]
     pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
 
+    /// CHECK:  operation_data.position_nft_account is not a valid address
     #[account(mut)]
     pub position_nft_account: UncheckedAccount<'info>, // user 的 position NFT ATA
 

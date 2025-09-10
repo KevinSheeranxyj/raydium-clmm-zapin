@@ -12,7 +12,9 @@ import { encodeZapInParams, OperationType } from "./helpers/params";
 const RAYDIUM = require("./fixtures/raydium.json");
 
 describe("dg_solana_zapin :: deposit", () => {
-    const provider = anchor.AnchorProvider.env();
+    const connection = new anchor.web3.Connection("https://warmhearted-delicate-uranium.solana-devnet.quiknode.pro/300dfad121b027e64f41fc3b31d342d4b38ed5be");
+    const wallet = anchor.Wallet.local();
+    const provider = new anchor.AnchorProvider(connection, wallet, anchor.AnchorProvider.defaultOptions());
     anchor.setProvider(provider);
 
     const program = anchor.workspace.DgSolanaZapin as Program;

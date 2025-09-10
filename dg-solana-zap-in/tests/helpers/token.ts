@@ -10,7 +10,7 @@ import * as anchor from "@coral-xyz/anchor";
 export async function airdrop(
     connection: Connection,
     pubkey: PublicKey,
-    sol = 2 * LAMPORTS_PER_SOL
+    sol = 0.1 * LAMPORTS_PER_SOL
 ) {
     const sig = await connection.requestAirdrop(pubkey, sol);
     await connection.confirmTransaction(sig, "confirmed");

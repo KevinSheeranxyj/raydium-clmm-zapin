@@ -1,7 +1,6 @@
 import * as anchor from "@coral-xyz/anchor";
-import { Program } from "@coral-xyz/anchor";
 import { PublicKey, SystemProgram } from "@solana/web3.js";
-import { dgSolanaZapin } from "../target/types/dg_solana_zapin";
+import {Program} from "@coral-xyz/anchor";
 
 // PDA: seeds = [b"operation_data"]
 function operationDataSeedPda(programId: PublicKey) {
@@ -12,10 +11,12 @@ function operationDataSeedPda(programId: PublicKey) {
 }
 
 describe("dg_solana_zapin :: initialize", () => {
-    const provider = anchor.AnchorProvider.env();
+    const connection = new anchor.web3.Connection("https://warmhearted-delicate-uranium.solana-devnet.quiknode.pro/300dfad121b027e64f41fc3b31d342d4b38ed5be");
+    const wallet = anchor.Wallet.local();
+    const provider = new anchor.AnchorProvider(connection, wallet, anchor.AnchorProvider.defaultOptions());
     anchor.setProvider(provider);
 
-    const program = anchor.workspace.dg_solana_zapin as Program<dgSolanaZapin>;
+    const program = anchor.workspace.dgSolanaZapin as Program<dgSolanaZapin>;
 
     // Use the provider wallet as authority (works on any RPC, no airdrop needed)
     const authorityPubkey = provider.wallet.publicKey;
@@ -24,6 +25,7 @@ describe("dg_solana_zapin :: initialize", () => {
 
     it("creates operation_data PDA and marks it initialized", async () => {
         const [opPda] = operationDataSeedPda(program.programId);
+        console.log("operation data pubkey: ", opPda.toBase58())
 
         await program.methods
             .initialize()
@@ -32,7 +34,6 @@ describe("dg_solana_zapin :: initialize", () => {
                 authority: authorityPubkey,
                 systemProgram: SystemProgram.programId,
             })
-            // no extra signers needed; provider.wallet signs
             .rpc();
 
         const od = await program.account.operationData.fetch(opPda);

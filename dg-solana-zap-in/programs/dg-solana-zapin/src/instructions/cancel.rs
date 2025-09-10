@@ -1,18 +1,24 @@
+use anchor_lang::prelude::*;
 use anchor_lang::{Accounts, require};
-use anchor_lang::prelude::{Account, Context, Signer};
+use anchor_spl::token;
+use anchor_spl::token::{Token, TokenAccount};
+use crate::helpers::load_token_amount;
+use crate::state::ExecStage;
+use crate::errors::ErrorCode;
+use crate::OperationData;
 
 pub fn handler(ctx: Context<Cancel>, transfer_id: [u8; 32]) -> Result<()> {
-    let od = &mut ctx.accounts.operation_data;
+    let od_ro = &ctx.accounts.operation_data;
 
-    require!(od.initialized, OperationError::NotInitialized);
-    require!(!od.executed, OperationError::AlreadyExecuted);
-    require!(od.transfer_id == transfer_id, OperationError::InvalidTransferId);
+    require!(od_ro.initialized, ErrorCode::NotInitialized);
+    require!(!od_ro.executed, ErrorCode::AlreadyExecuted);
+    require!(od_ro.transfer_id == transfer_id, ErrorCode::InvalidTransferId);
     // 允许 authority 或 executor 触发
     require!(
-            ctx.accounts.user.key() == od.executor || ctx.accounts.user.key() == od.authority,
-            OperationError::Unauthorized
+            ctx.accounts.user.key() == od_ro.executor || ctx.accounts.user.key() == od_ro.authority,
+            ErrorCode::Unauthorized
         );
-    require!(od.stage != ExecStage::Finalized, OperationError::InvalidParams);
+    require!(od_ro.stage != ExecStage::Finalized, ErrorCode::InvalidParams);
 
     let bump = ctx.bumps.operation_data;
     let seeds = &[b"operation_data".as_ref(), transfer_id.as_ref(), &[bump]];
@@ -43,6 +49,7 @@ pub fn handler(ctx: Context<Cancel>, transfer_id: [u8; 32]) -> Result<()> {
         token::transfer(cpi_ctx, bal1)?;
     }
 
+    let od = &mut ctx.accounts.operation_data;
     od.executed = true;
     od.stage = ExecStage::Finalized;
     Ok(())

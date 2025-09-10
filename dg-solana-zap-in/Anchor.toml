@@ -6,16 +6,16 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-dg_solana_zapin = "86dsQeMpQW5m1LpyPQ1Ss7GpViW3moUwF5YsPH1ibFee"
+dg_solana_zapin = "DisiSrRg8fWzsy8UXAGwh8VobnCTTg1uiC6iKSNaBrYL"
 
 [programs.mainnet]
-dg_solana_zapin = "DgrQqeR5MTFkNNG94siEd5cDxdzgexSNwbv4FHdNW8f3"
+dg_solana_zapin = "DisiSrRg8fWzsy8UXAGwh8VobnCTTg1uiC6iKSNaBrYL"
 
 [registry]
 url = "https://api.apr.dev"
 
 [provider]
-cluster = "mainnet"
+cluster = "devnet"
 wallet = "~/.config/solana/admin.json"
 
 [scripts]
