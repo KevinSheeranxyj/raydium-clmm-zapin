@@ -196,53 +196,6 @@ pub fn to_hex32(bytes: &[u8;32]) -> String {
     String::from_utf8(out.to_vec()).unwrap()
 }
 
-#[inline]
-fn apply_slippage_min(amount: u64, slippage_bps: u32) -> u64 {
-    // min_out = amount * (1 - bps/1e4)
-    let one = 10_000u128;
-    let bps = (slippage_bps as u128).min(one);
-    let num = (amount as u128).saturating_mul(one.saturating_sub(bps));
-    (num / one) as u64
-}
-
-#[inline]
-fn amounts_from_liquidity_burn_q64(
-    sa: u128,    // sqrt(P_lower) in Q64.64
-    sb: u128,    // sqrt(P_upper) in Q64.64
-    sp: u128,    // sqrt(P_current) in Q64.64
-    d_liq: u128, // ΔL (liquidity to burn)
-) -> (u64, u64) {
-    assert!(sa < sb, "invalid tick bounds");
-    if d_liq == 0 {
-        return (0, 0);
-    }
-    let sa_u = U256::from(sa);
-    let sb_u = U256::from(sb);
-    let sp_u = U256::from(sp);
-    let dL_u = U256::from(d_liq);
-    let q64  = U256::from(Q64_U128);
-    let diff_sb_sa = sb_u - sa_u;
-
-    let (amount0_u256, amount1_u256) = if sp_u <= sa_u {
-        let num0 = dL_u * diff_sb_sa * q64;
-        let den0 = sa_u * sb_u;
-        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::from(0));
-        (a0, U256::from(0))
-    } else if sp_u >= sb_u {
-        let a1 = (dL_u * diff_sb_sa).mul_div_floor(U256::from(1u8), q64).unwrap_or(U256::from(0));
-        (U256::from(0), a1)
-    } else {
-        let num0 = dL_u * (sb_u - sp_u) * q64;
-        let den0 = sp_u * sb_u;
-        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::from(0));
-        let a1 = (dL_u * (sp_u - sa_u)).mul_div_floor(U256::from(1u8), q64).unwrap_or(U256::from(0));
-        (a0, a1)
-    };
-
-    let amount0 = amount0_u256.to_underflow_u64();
-    let amount1 = amount1_u256.to_underflow_u64();
-    (amount0, amount1)
-}
 
 /// Helper function to deserialize params
 pub fn deserialize_params<T: AnchorDeserialize>(data: &[u8]) -> anchor_lang::Result<T> {
@@ -293,7 +246,7 @@ fn find_acc_idx(ras: &[AccountInfo], key: &Pubkey, label: &str) -> anchor_lang::
         })
 }
 
-fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
+pub fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
     // Only SPL Token or Token-2022 accounts can be unpacked
     if *ai.owner != token::ID && *ai.owner != anchor_spl::token_2022::ID {
         return None;
@@ -301,5 +254,59 @@ fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
     let Ok(data) = ai.try_borrow_data() else { return None; };
     if data.len() < spl_token::state::Account::LEN { return None; }
     spl_token::state::Account::unpack_from_slice(&data).ok()
+}
+
+#[inline]
+pub fn apply_slippage_min(amount: u64, slippage_bps: u32) -> u64 {
+    // min_out = amount * (1 - bps/1e4)
+    let one = 10_000u128;
+    let bps = (slippage_bps as u128).min(one);
+    let num = (amount as u128).saturating_mul(one.saturating_sub(bps));
+    (num / one) as u64
+}
+
+#[inline]
+pub fn amounts_from_liquidity_burn_q64(
+    sa: u128,    // sqrt(P_lower) in Q64.64
+    sb: u128,    // sqrt(P_upper) in Q64.64
+    sp: u128,    // sqrt(P_current) in Q64.64
+    d_liq: u128, // ΔL (liquidity to burn)
+) -> (u64, u64) {
+    assert!(sa < sb, "invalid tick bounds");
+    if d_liq == 0 {
+        return (0, 0);
+    }
+    let sa_u = U256::from(sa);
+    let sb_u = U256::from(sb);
+    let sp_u = U256::from(sp);
+    let dL_u = U256::from(d_liq);
+    let q64  = U256::from(Q64_U128);
+    let diff_sb_sa = sb_u - sa_u;
+
+    let (amount0_u256, amount1_u256) = if sp_u <= sa_u {
+        let num0 = dL_u * diff_sb_sa * q64;
+        let den0 = sa_u * sb_u;
+        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::from(0));
+        (a0, U256::from(0))
+    } else if sp_u >= sb_u {
+        let a1 = (dL_u * diff_sb_sa).mul_div_floor(U256::from(1u8), q64).unwrap_or(U256::from(0));
+        (U256::from(0), a1)
+    } else {
+        let num0 = dL_u * (sb_u - sp_u) * q64;
+        let den0 = sp_u * sb_u;
+        let a0 = num0.mul_div_floor(U256::from(1u8), den0).unwrap_or(U256::from(0));
+        let a1 = (dL_u * (sp_u - sa_u)).mul_div_floor(U256::from(1u8), q64).unwrap_or(U256::from(0));
+        (a0, a1)
+    };
+
+    let amount0 = amount0_u256.to_underflow_u64();
+    let amount1 = amount1_u256.to_underflow_u64();
+    (amount0, amount1)
+}
+
+/// 将 transfer_id 字符串转换为 32 字节哈希
+pub fn transfer_id_hash_bytes(transfer_id: &str) -> [u8; 32] {
+    let hash = anchor_lang::solana_program::keccak::hash(transfer_id.as_bytes());
+    hash.to_bytes()
 }
 

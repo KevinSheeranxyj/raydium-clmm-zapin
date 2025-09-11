@@ -39,12 +39,12 @@ use crate::errors::ErrorCode;
 
 
 use crate::helpers::{to_hex32, deserialize_params, tick_array_start_index};
-use crate::state::{ExecStage, OperationType, TransferParams, ZapInParams};
+use crate::state::{ExecStage, OperationType, TransferParams, ZapInParams, Registry};
 use crate::events::{DepositEvent, ExecutorAssigned};
 
 // Devnet: DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH
 pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
-    pubkey!("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH"); // mainnet program ID
+    pubkey!("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH"); // devnet program ID
 
 /// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
 #[program]
@@ -200,6 +200,16 @@ pub mod dg_solana_zapin {
 
     pub fn cancel(ctx: Context<Cancel>, transfer_id: [u8;32]) -> Result<()> {
         instructions::cancel::handler(ctx, transfer_id)
+    }
+
+    // Withdraw instruction
+    pub fn withdraw(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
+        instructions::withdraw::handler(ctx, p)
+    }
+
+    // Claim instruction
+    pub fn claim(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
+        instructions::claim::handler(ctx, p)
     }
 
     // Modify PDA Authority
@@ -359,16 +369,6 @@ pub struct Deposit<'info> {
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }
-#[account]
-pub struct Registry {
-    pub used_ids: Vec<[u8; 32]>,
-}
-
-impl Registry {
-    pub const START_CAP: usize = 32;
-    pub const LEN: usize = 4 + Self::START_CAP * 32;
-}
-
 
 #[derive(Accounts)]
 #[instruction(transfer_id: String)]

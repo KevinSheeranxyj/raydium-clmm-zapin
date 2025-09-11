@@ -19,3 +19,11 @@ pub struct ExecutorAssigned {
     pub transfer_id_hex: String,
     pub executor: Pubkey,
 }
+
+#[event]
+pub struct ClaimEvent {
+    pub pool: Pubkey,
+    pub beneficiary: Pubkey, // = user_da
+    pub mint: Pubkey,        // 实际 USDC mint
+    pub amount: u64,         // 实转金额
+}

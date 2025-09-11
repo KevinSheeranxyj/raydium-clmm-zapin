@@ -1,0 +1,38 @@
+{
+  "CLMM_PROGRAM_ID": "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+  "POOL_STATE": "8BnEgHoWFysVcuFFX7QztDmzuH8r5ZFvyP3sYwn1XTh6",
+  "AMM_CONFIG": "2QdhepnKRTLjjSqj1oeoRjy7PJZ7RX9Q9FdcQzq6BEin",
+  "OBSERVATION_STATE": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQffMztkOvEDB",
+  "TOKEN_VAULT_0": "FgZut2qVQEyPBibaTJbbX2PxaM6vT1Sqr1D6A2inD9sP",
+  "TOKEN_VAULT_1": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+  "TOKEN_MINT_0": "So11111111111111111111111111111111111111112",
+  "TOKEN_MINT_1": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "TICK_SPACING": 1,
+  "SQRT_PRICE_X64": "79228162514264337593543950336",
+  "exampleTicks": {
+    "tickLower": -120,
+    "tickUpper": 120
+  },
+  "description": "Raydium CLMM SOL/USDC pool configuration (example addresses)",
+  "network": "devnet",
+  "poolType": "CLMM",
+  "feeRate": 0.0001,
+  "protocolFeeRate": 0.0001,
+  "note": "These are example addresses. Replace with actual pool addresses.",
+  "instructions": {
+    "howToGetRealAddresses": [
+      "1. Visit Raydium's interface: https://raydium.io/",
+      "2. Go to Pools section and find CLMM pools",
+      "3. Select a SOL/USDC pool",
+      "4. Copy the pool address and related addresses",
+      "5. Use Solana Explorer to verify addresses",
+      "6. Replace the example addresses in this config"
+    ],
+    "alternativeMethods": [
+      "Use Raydium SDK to query pool information",
+      "Use Solana RPC to get account information",
+      "Check Raydium's GitHub for pool addresses",
+      "Use third-party APIs like Jupiter or Birdeye"
+    ]
+  }
+}

@@ -13,17 +13,11 @@
     "tickLower": -120,
     "tickUpper": 120
   },
-  "description": "Raydium CLMM SOL/USDC pool from devnet RPC query",
+  "description": "Raydium CLMM pool from devnet RPC query",
   "network": "devnet",
   "poolType": "CLMM",
   "feeRate": 0.0001,
   "protocolFeeRate": 0.0001,
   "source": "RPC Query",
-  "lastUpdated": "2025-09-11T01:32:06.804Z",
-  "note": "Real devnet pool addresses obtained via RPC query",
-  "verification": {
-    "poolState": "Verified via RPC query",
-    "tokens": "SOL/USDC pair confirmed",
-    "network": "devnet"
-  }
+  "lastUpdated": "2025-09-11T01:32:06.804Z"
 }
