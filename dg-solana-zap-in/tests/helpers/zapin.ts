@@ -181,7 +181,7 @@ export class ZapInClient {
             .prepareExecute(transferId)
             .accounts({
                 operationData: operationDataPda,
-                user: user.publicKey,
+                caller: user.publicKey,
                 programTokenAccount: programTokenAccount.address,
                 refundAta: refundAta,
                 pdaToken0: pdaToken0.address,

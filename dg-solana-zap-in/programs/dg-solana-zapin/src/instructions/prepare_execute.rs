@@ -11,19 +11,18 @@ use crate::OperationData;
 pub fn handler(ctx: Context<PrepareExecute>, transfer_id: [u8; 32]) -> Result<()> {
     // 仅以不可变借用读取，避免与后续 CPI 的不可变借用冲突
     let od_ro = &ctx.accounts.operation_data;
-
+    let user = od_ro.executor;
     // 基本校验
     require!(od_ro.initialized, ErrorCode::NotInitialized);
     require!(!od_ro.executed, ErrorCode::AlreadyExecuted);
     require!(od_ro.transfer_id == transfer_id, ErrorCode::InvalidTransferId);
     require!(matches!(od_ro.operation_type, OperationType::ZapIn), ErrorCode::InvalidParams);
-    require!(ctx.accounts.user.key() == od_ro.executor, ErrorCode::Unauthorized);
+    require!(ctx.accounts.caller.key() == od_ro.executor || ctx.accounts.caller.key() == od_ro.authority, ErrorCode::Unauthorized);
     require!(od_ro.stage == ExecStage::None, ErrorCode::InvalidParams);
 
     // 解析参数 + tick 校验 + 派生 tick arrays / protocol position（先计算，稍后再写回）
     let p: ZapInParams = deserialize_params(&od_ro.action)?;
     require!(p.tick_lower < p.tick_upper, ErrorCode::InvalidTickRange);
-    require_keys_eq!(od_ro.pool_state, ctx.accounts.pool_state.key(), ErrorCode::InvalidParams);
 
     let pool = ctx.accounts.pool_state.load()?;
     let tick_spacing: i32 = pool.tick_spacing.into();
@@ -32,23 +31,23 @@ pub fn handler(ctx: Context<PrepareExecute>, transfer_id: [u8; 32]) -> Result<()
     let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
 
     let (ta_lower, _) = Pubkey::find_program_address(
-        &[TICK_ARRAY_SEED.as_bytes(), od_ro.pool_state.as_ref(), &lower_start.to_be_bytes()],
-        &od_ro.clmm_program_id,
+        &[TICK_ARRAY_SEED.as_bytes(), ctx.accounts.pool_state.key().as_ref(), &lower_start.to_be_bytes()],
+        &ctx.accounts.clmm_program.key(),
     );
     let (ta_upper, _) = Pubkey::find_program_address(
-        &[TICK_ARRAY_SEED.as_bytes(), od_ro.pool_state.as_ref(), &upper_start.to_be_bytes()],
-        &od_ro.clmm_program_id,
+        &[TICK_ARRAY_SEED.as_bytes(), ctx.accounts.pool_state.key().as_ref(), &upper_start.to_be_bytes()],
+        &ctx.accounts.clmm_program.key(),
     );
     let (pp, _) = Pubkey::find_program_address(
-        &[POSITION_SEED.as_bytes(), od_ro.pool_state.as_ref(), &lower_start.to_be_bytes(), &upper_start.to_be_bytes()],
-        &od_ro.clmm_program_id,
+        &[POSITION_SEED.as_bytes(), ctx.accounts.pool_state.key().as_ref(), &lower_start.to_be_bytes(), &upper_start.to_be_bytes()],
+        &ctx.accounts.clmm_program.key(),
     );
 
     // 确定输入侧：program_token_account 的 mint 是否等于 token_mint_0
-    let is_base_input = ctx.accounts.program_token_account.mint == od_ro.token_mint_0;
+    let is_base_input = ctx.accounts.program_token_account.mint == ctx.accounts.token_mint_0.key();
     require!(
-            ctx.accounts.program_token_account.mint == od_ro.token_mint_0
-            || ctx.accounts.program_token_account.mint == od_ro.token_mint_1,
+            ctx.accounts.program_token_account.mint == ctx.accounts.token_mint_0.key()
+            || ctx.accounts.program_token_account.mint == ctx.accounts.token_mint_1.key(),
             ErrorCode::InvalidMint
         );
 
@@ -81,9 +80,9 @@ pub fn handler(ctx: Context<PrepareExecute>, transfer_id: [u8; 32]) -> Result<()
     let signer_seeds = &[&seeds[..]];
 
     let (dst, expect_mint) = if is_base_input {
-        (&ctx.accounts.pda_token0, od_ro.token_mint_0)
+        (&ctx.accounts.pda_token0, ctx.accounts.token_mint_0.key())
     } else {
-        (&ctx.accounts.pda_token1, od_ro.token_mint_1)
+        (&ctx.accounts.pda_token1, ctx.accounts.token_mint_1.key())
     };
     // 账户一致性约束（运行时再校验一次）
     require!(dst.owner == od_ro.key(), ErrorCode::InvalidProgramAccount);
@@ -100,20 +99,13 @@ pub fn handler(ctx: Context<PrepareExecute>, transfer_id: [u8; 32]) -> Result<()
 
     // Position NFT mint 的派生（存起来，后续 open_position 使用）
     let mut od = &mut ctx.accounts.operation_data;
-    if od.position_nft_mint == Pubkey::default() {
-        let (m, _) = Pubkey::find_program_address(
-            &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), od.pool_state.as_ref()],
-            ctx.program_id,
-        );
-        od.position_nft_mint = m;
-    }
+    // 由于position_nft_mint字段已删除，这里不再需要设置
 
     // 写入前面计算的派生结果
     od.tick_lower = p.tick_lower;
     od.tick_upper = p.tick_upper;
     od.tick_array_lower = ta_lower;
     od.tick_array_upper = ta_upper;
-    od.protocol_position = pp;
 
     od.base_input_flag = is_base_input;
     od.stage = ExecStage::Prepared;
@@ -131,7 +123,7 @@ pub struct PrepareExecute<'info> {
     pub operation_data: Account<'info, OperationData>,
 
     #[account(mut)]
-    pub user: Signer<'info>,
+    pub caller: Signer<'info>,
 
     #[account(
         mut,
@@ -142,33 +134,39 @@ pub struct PrepareExecute<'info> {
     #[account(mut)]
     pub refund_ata: Account<'info, TokenAccount>,
 
+    // Raydium Program
+    pub clmm_program: Program<'info, raydium_amm_v3::program::AmmV3>,
+    
+    // 池 & 配置
+    #[account(mut)]
+    pub pool_state: AccountLoader<'info, PoolState>,
+    #[account(address = pool_state.load()?.amm_config)]
+    pub amm_config: Box<Account<'info, AmmConfig>>,
+    #[account(mut, address = pool_state.load()?.observation_key)]
+    pub observation_state: AccountLoader<'info, ObservationState>,
+    
+    // Vault & Mint
+    #[account(mut, address = pool_state.load()?.token_vault_0)]
+    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+    #[account(mut, address = pool_state.load()?.token_vault_1)]
+    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
+    #[account(address = pool_state.load()?.token_mint_0)]
+    pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
+    #[account(address = pool_state.load()?.token_mint_1)]
+    pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
+
+    // PDA token accounts
     #[account(
         mut,
-        constraint = pda_token0.owner == operation_data.key() @ ErrorCode::InvalidProgramAccount,
-        constraint = pda_token0.mint  == operation_data.token_mint_0 @ ErrorCode::InvalidMint,
+        constraint = pda_token0.owner == operation_data.key() @ ErrorCode::InvalidProgramAccount
     )]
     pub pda_token0: Account<'info, TokenAccount>,
+    
     #[account(
         mut,
-        constraint = pda_token1.owner == operation_data.key() @ ErrorCode::InvalidProgramAccount,
-        constraint = pda_token1.mint  == operation_data.token_mint_1 @ ErrorCode::InvalidMint,
+        constraint = pda_token1.owner == operation_data.key() @ ErrorCode::InvalidProgramAccount
     )]
     pub pda_token1: Account<'info, TokenAccount>,
-
-    #[account(mut, address = operation_data.pool_state)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-    #[account(address = operation_data.amm_config)]
-    pub amm_config: Box<Account<'info, AmmConfig>>,
-    #[account(address = operation_data.observation_state)]
-    pub observation_state: AccountLoader<'info, ObservationState>,
-    #[account(address = operation_data.token_vault_0)]
-    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(address = operation_data.token_vault_1)]
-    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(address = operation_data.token_mint_0)]
-    pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = operation_data.token_mint_1)]
-    pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
 
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,

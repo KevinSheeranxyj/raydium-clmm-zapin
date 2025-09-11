@@ -90,30 +90,28 @@ pub struct IncreaseLiquidity<'info> {
 
     pub clmm_program: Program<'info, AmmV3>,
 
-    #[account(mut, address = operation_data.pool_state)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-    /// CHECK:  operation_data.protocol_position is not a valid address
-    #[account(mut, address = operation_data.protocol_position)]
-    pub protocol_position: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK:  operation_data.personal_position is not a valid address
+    pub pool_state: AccountLoader<'info, PoolState>,
+    /// CHECK: 由外部传入的protocol position账户
+    pub protocol_position: UncheckedAccount<'info>,
+    /// CHECK: 由外部传入的personal position账户
     pub personal_position: UncheckedAccount<'info>,
-    #[account(mut, address = operation_data.tick_array_lower)]
+    /// CHECK: 由外部传入的tick array lower账户
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
-    #[account(mut, address = operation_data.tick_array_upper)]
+    /// CHECK: 由外部传入的tick array upper账户
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
 
     #[account(mut)]
     pub pda_token0: Account<'info, TokenAccount>,
     #[account(mut)]
     pub pda_token1: Account<'info, TokenAccount>,
-    #[account(mut, address = operation_data.token_vault_0)]
+    #[account(mut, address = pool_state.load()?.token_vault_0)]
     pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = operation_data.token_vault_1)]
+    #[account(mut, address = pool_state.load()?.token_vault_1)]
     pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(address = operation_data.token_mint_0)]
+    #[account(address = pool_state.load()?.token_mint_0)]
     pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = operation_data.token_mint_1)]
+    #[account(address = pool_state.load()?.token_mint_1)]
     pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
 
     /// CHECK:  operation_data.position_nft_account is not a valid address

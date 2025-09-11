@@ -148,25 +148,25 @@ pub struct SwapForBalance<'info> {
     pub clmm_program: Program<'info, AmmV3>,
 
     // 池相关（可 mut）
-    #[account(mut, address = operation_data.pool_state)]
+    #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
-    #[account(address = operation_data.amm_config)]
+    #[account(address = pool_state.load()?.amm_config)]
     pub amm_config: Box<Account<'info, AmmConfig>>,
-    #[account(mut, address = operation_data.observation_state)]
+    #[account(mut, address = pool_state.load()?.observation_key)]
     pub observation_state: AccountLoader<'info, ObservationState>,
 
     // PDA 自有 token 账户（作为 input/output）
-    #[account(mut, address = operation_data.token_mint_0 @ ErrorCode::InvalidMint)]
+    #[account(address = pool_state.load()?.token_mint_0)]
     pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(mut, address = operation_data.token_mint_1 @ ErrorCode::InvalidMint)]
+    #[account(address = pool_state.load()?.token_mint_1)]
     pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
     #[account(mut)]
     pub pda_token0: Account<'info, TokenAccount>,
     #[account(mut)]
     pub pda_token1: Account<'info, TokenAccount>,
-    #[account(mut, address = operation_data.token_vault_0)]
+    #[account(mut, address = pool_state.load()?.token_vault_0)]
     pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = operation_data.token_vault_1)]
+    #[account(mut, address = pool_state.load()?.token_vault_1)]
     pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     pub token_program: Program<'info, Token>,

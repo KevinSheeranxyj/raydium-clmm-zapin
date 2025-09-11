@@ -107,64 +107,13 @@ pub mod dg_solana_zapin {
         od.ca = ca;
         od.operation_type = operation_type.clone();
         od.action = action.clone(); // 保留原始参数
-        od.executor = authorized_executor; // 授权执行人
-        // ====== 存 Raydium 固定账户（直接从 ctx 读 pubkey）======
-        msg!("clmm_program_id: {}", ctx.accounts.clmm_program.key());
-        od.clmm_program_id   = ctx.accounts.clmm_program.key();
-        od.pool_state        = ctx.accounts.pool_state.key();
-        od.amm_config        = ctx.accounts.amm_config.key();
-        od.observation_state = ctx.accounts.observation_state.key();
-        od.token_vault_0     = ctx.accounts.token_vault_0.key();
-        od.token_vault_1     = ctx.accounts.token_vault_1.key();
-        od.token_mint_0      = ctx.accounts.token_mint_0.key();
-        od.token_mint_1      = ctx.accounts.token_mint_1.key();
+        od.executor = authorized_executor; // authorized executor
 
         // 如果是 ZapIn，解析参数并派生 tick array / protocol_position 等，存起来
         if let OperationType::ZapIn = operation_type {
             let p: ZapInParams = deserialize_params(&od.action)?;
             od.tick_lower = p.tick_lower;
             od.tick_upper = p.tick_upper;
-
-            // 根据 pool 的 tick_spacing 计算 tick array 起始
-            let pool = ctx.accounts.pool_state.load()?;
-            let tick_spacing: i32 = pool.tick_spacing.into();
-            let lower_start = tick_array_start_index(p.tick_lower, tick_spacing);
-            let upper_start = tick_array_start_index(p.tick_upper, tick_spacing);
-
-            // Raydium tick array PDA（由外部提供，但我们把“应有地址”存起来用作后续校验）
-            let (ta_lower, _) = Pubkey::find_program_address(
-                &[
-                    TICK_ARRAY_SEED.as_bytes(),
-                    ctx.accounts.pool_state.key().as_ref(),
-                    &lower_start.to_be_bytes(),
-                ],
-                &ctx.accounts.clmm_program.key(),
-            );
-            let (ta_upper, _) = Pubkey::find_program_address(
-                &[
-                    TICK_ARRAY_SEED.as_bytes(),
-                    ctx.accounts.pool_state.key().as_ref(),
-                    &upper_start.to_be_bytes(),
-                ],
-                &ctx.accounts.clmm_program.key(),
-            );
-            od.tick_array_lower = ta_lower;
-            od.tick_array_upper = ta_upper;
-
-            // 协议仓位 PDA（Raydium POSITION_SEED, pool, lower_start, upper_start）
-            let (pp, _) = Pubkey::find_program_address(
-                &[
-                    POSITION_SEED.as_bytes(),
-                    ctx.accounts.pool_state.key().as_ref(),
-                    &lower_start.to_be_bytes(),
-                    &upper_start.to_be_bytes(),
-                ],
-                &ctx.accounts.clmm_program.key(),
-            );
-            od.protocol_position = pp;
-
-            // Position NFT mint（deposit 阶段未持有 user；先置空，execute 再写）
-            od.position_nft_mint = Pubkey::default();
         }
 
         // 如果是 Transfer，存 recipient
@@ -186,11 +135,11 @@ pub mod dg_solana_zapin {
         instructions::swap_for_balance::handler(ctx, transfer_id)
     }
 
-    pub fn open_position_step(ctx: Context<OpenPosition>, transfer_id: [u8;32]) -> Result<()> {
+    pub fn open_position(ctx: Context<OpenPosition>, transfer_id: [u8;32]) -> Result<()> {
         instructions::open_position::handler(ctx, transfer_id)
     }
 
-    pub fn increase_liquidity_step(ctx: Context<IncreaseLiquidity>, transfer_id: [u8;32]) -> Result<()> {
+    pub fn increase_liquidity(ctx: Context<IncreaseLiquidity>, transfer_id: [u8;32]) -> Result<()> {
         instructions::increase_liquidity::handler(ctx, transfer_id)
     }
 
@@ -243,8 +192,10 @@ pub struct Initialize<'info> {
         bump
     )]
     pub operation_data: Account<'info, OperationData>,
-    #[account(mut)]
+    #[account(mut)] // solver 
     pub authority: Signer<'info>,
+    /// CHECK: solver admin
+    pub set_solver: UncheckedAccount<'info>, 
     pub system_program: Program<'info, System>,
 }
 #[account]
@@ -261,27 +212,11 @@ pub struct OperationData {
     pub executed: bool,
     pub ca: Pubkey,           // contract address
 
-    pub executor: Pubkey,     // 授权执行人
-
-    // ===== Raydium CLMM & 池静态信息（deposit 时落库） =====
-    pub clmm_program_id: Pubkey, // << 新增：存 Raydium 程序ID
-    pub pool_state: Pubkey,
-    pub amm_config: Pubkey,
-    pub observation_state: Pubkey,
-    pub token_vault_0: Pubkey,
-    pub token_vault_1: Pubkey,
-    pub token_mint_0: Pubkey,
-    pub token_mint_1: Pubkey,
-
-    // ===== ZapIn/Position 相关 =====
+    pub executor: Pubkey,     // authority executor
     pub tick_lower: i32,
     pub tick_upper: i32,
     pub tick_array_lower: Pubkey,
     pub tick_array_upper: Pubkey,
-    pub protocol_position: Pubkey,
-    pub personal_position: Pubkey,
-    pub position_nft_mint: Pubkey,
-
     // ===== 执行阶段控制 =====
     pub stage: ExecStage,      // << 新增
     pub base_input_flag: bool, // << 新增：是否 token0 为输入
@@ -300,10 +235,8 @@ impl OperationData {
             + 1  // executed
             + 32 // ca
             + 32 // executor
-            + 32 // clmm_program_id
-            + 32*7 // pool/vault/mint 共7个
             + 4 + 4 // tick_lower/tick_upper
-            + 32*5 // tick arrays + positions + nft mint
+            + 32*2 // tick_array_lower + tick_array_upper
             + 1  // stage (enum tag)
             + 1; // base_input_flag
 }
@@ -343,27 +276,6 @@ pub struct Deposit<'info> {
         constraint = program_token_account.owner == operation_data.key() @ ErrorCode::InvalidProgramAccount
     )]
     pub program_token_account: Account<'info, TokenAccount>,
-
-    // ---- Raydium Program（你在 deposit 里用到了 clmm_program.key()） ----
-    pub clmm_program: Program<'info, AmmV3>,
-
-    // 池 & 配置
-    #[account(mut)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-    #[account(address = pool_state.load()?.amm_config)]
-    pub amm_config: Box<Account<'info, AmmConfig>>,
-    #[account(mut, address = pool_state.load()?.observation_key)]
-    pub observation_state: AccountLoader<'info, ObservationState>,
-
-    // Vault & Mint
-    #[account(mut, address = pool_state.load()?.token_vault_0)]
-    pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = pool_state.load()?.token_vault_1)]
-    pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(address = pool_state.load()?.token_mint_0)]
-    pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = pool_state.load()?.token_mint_1)]
-    pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
 
     // ---- 必须加：init / init_if_needed 需要 system_program；CPI 转账需要 token_program ----
     pub token_program: Program<'info, Token>,

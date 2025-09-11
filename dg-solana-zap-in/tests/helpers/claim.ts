@@ -34,48 +34,55 @@ export class ClaimClient {
     }
 
     /**
-     * 执行claim操作
+     * 执行claim操作（新版本，不需要transfer_id）
      */
     async claim(
-        transferId: string,
         params: ClaimParams,
         user: Keypair,
+        nftMint: PublicKey,
         remainingAccounts: PublicKey[]
     ): Promise<string> {
-        const [operationDataPda] = PublicKey.findProgramAddressSync(
-            [Buffer.from("operation_data"), Buffer.from(transferId)],
+        // 计算claim PDA
+        const [claimPda] = PublicKey.findProgramAddressSync(
+            [Buffer.from("claim_pda"), user.publicKey.toBuffer(), nftMint.toBuffer()],
             this.program.programId
         );
 
-        const [registryPda] = PublicKey.findProgramAddressSync(
-            [Buffer.from("registry")],
-            this.program.programId
-        );
-
-        // 计算position NFT mint
-        const [positionNftMint] = PublicKey.findProgramAddressSync(
-            [Buffer.from("pos_nft_mint"), user.publicKey.toBuffer(), this.poolConfig.poolState.toBuffer()],
-            this.program.programId
-        );
-
-        // 计算position NFT ATA
-        const positionNftAccount = PublicKey.findAssociatedTokenAddressSync(
+        // 计算NFT账户
+        const nftAccount = PublicKey.findAssociatedTokenAddressSync(
             user.publicKey,
-            positionNftMint
+            nftMint
+        );
+
+        // 计算接收账户（假设用户想要接收token0）
+        const recipientTokenAccount = PublicKey.findAssociatedTokenAddressSync(
+            user.publicKey,
+            this.poolConfig.tokenMint0
         );
 
         const tx = await this.program.methods
-            .claim(transferId, { minPayout: new this.program.BN(params.minPayout) })
+            .claim({ minPayout: new this.program.BN(params.minPayout) })
             .accounts({
-                operationData: operationDataPda,
-                registry: registryPda,
                 user: user.publicKey,
                 memoProgram: new PublicKey("MemoSq4gqABAX3b7cqRUpy4U5M1ZcvTd5Z73s3J6"),
                 clmmProgram: this.poolConfig.clmmProgramId,
                 tokenProgram: TOKEN_PROGRAM_ID,
                 tokenProgram2022: new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
+                systemProgram: SystemProgram.programId,
+                poolState: this.poolConfig.poolState,
+                ammConfig: this.poolConfig.ammConfig,
+                observationState: this.poolConfig.observationState,
+                protocolPosition: remainingAccounts[0], // 从remaining accounts获取
+                personalPosition: remainingAccounts[1],
+                tickArrayLower: remainingAccounts[2],
+                tickArrayUpper: remainingAccounts[3],
+                tokenVault0: this.poolConfig.tokenVault0,
+                tokenVault1: this.poolConfig.tokenVault1,
+                tokenMint0: this.poolConfig.tokenMint0,
+                tokenMint1: this.poolConfig.tokenMint1,
+                nftAccount: nftAccount,
+                recipientTokenAccount: recipientTokenAccount,
             })
-            .remainingAccounts(remainingAccounts)
             .signers([user])
             .rpc();
 
@@ -87,11 +94,16 @@ export class ClaimClient {
      */
     buildRemainingAccounts(
         user: Keypair,
-        operationDataPda: PublicKey,
-        positionNftMint: PublicKey,
-        positionNftAccount: PublicKey,
-        recipientTokenAccount: PublicKey
+        nftMint: PublicKey,
+        tickLower: number,
+        tickUpper: number
     ): PublicKey[] {
+        // 计算tick array PDAs
+        const [tickArrayLower, tickArrayUpper] = this.calculateTickArrayPdas(tickLower, tickUpper);
+        
+        // 计算position PDAs
+        const [protocolPosition, personalPosition] = this.calculatePositionPdas(tickLower, tickUpper);
+
         return [
             // Programs
             TOKEN_PROGRAM_ID,
@@ -109,26 +121,19 @@ export class ClaimClient {
             this.poolConfig.tokenMint0,
             this.poolConfig.tokenMint1,
 
-            // Tick arrays (需要从外部计算)
-            // tickArrayLower,
-            // tickArrayUpper,
+            // Tick arrays
+            tickArrayLower,
+            tickArrayUpper,
 
-            // Positions (需要从外部计算)
-            // protocolPosition,
-            // personalPosition,
-
-            // Operation data PDA
-            operationDataPda,
-
-            // PDA token accounts
-            // inputTokenAccount,
-            // outputTokenAccount,
+            // Positions
+            protocolPosition,
+            personalPosition,
 
             // Position NFT
-            positionNftAccount,
+            PublicKey.findAssociatedTokenAddressSync(user.publicKey, nftMint),
 
-            // Recipient token account
-            recipientTokenAccount,
+            // Recipient token account (假设用户想要接收token0)
+            PublicKey.findAssociatedTokenAddressSync(user.publicKey, this.poolConfig.tokenMint0),
         ];
     }
 
@@ -197,101 +202,110 @@ export class ClaimClient {
     }
 
     /**
-     * 计算PDA token accounts
-     */
-    calculatePdaTokenAccounts(operationDataPda: PublicKey): [PublicKey, PublicKey] {
-        const [inputTokenAccount] = PublicKey.findProgramAddressSync(
-            [operationDataPda.toBuffer(), this.poolConfig.tokenMint0.toBuffer()],
-            this.program.programId
-        );
-
-        const [outputTokenAccount] = PublicKey.findProgramAddressSync(
-            [operationDataPda.toBuffer(), this.poolConfig.tokenMint1.toBuffer()],
-            this.program.programId
-        );
-
-        return [inputTokenAccount, outputTokenAccount];
-    }
-
-    /**
-     * 完整的claim流程
+     * 完整的claim流程（新版本）
      */
     async executeClaim(
-        transferId: string,
         params: ClaimParams,
         user: Keypair,
+        nftMint: PublicKey,
         tickLower: number,
-        tickUpper: number,
-        recipientTokenAccount: PublicKey
+        tickUpper: number
     ): Promise<string> {
         console.log("Starting claim process...");
 
         // 计算所有必要的PDAs
-        const [operationDataPda] = PublicKey.findProgramAddressSync(
-            [Buffer.from("operation_data"), Buffer.from(transferId)],
+        const [claimPda] = PublicKey.findProgramAddressSync(
+            [Buffer.from("claim_pda"), user.publicKey.toBuffer(), nftMint.toBuffer()],
             this.program.programId
         );
 
-        const [positionNftMint] = PublicKey.findProgramAddressSync(
-            [Buffer.from("pos_nft_mint"), user.publicKey.toBuffer(), this.poolConfig.poolState.toBuffer()],
-            this.program.programId
-        );
-
-        const positionNftAccount = PublicKey.findAssociatedTokenAddressSync(
+        const nftAccount = PublicKey.findAssociatedTokenAddressSync(
             user.publicKey,
-            positionNftMint
+            nftMint
         );
 
         const [tickArrayLower, tickArrayUpper] = this.calculateTickArrayPdas(tickLower, tickUpper);
         const [protocolPosition, personalPosition] = this.calculatePositionPdas(tickLower, tickUpper);
-        const [inputTokenAccount, outputTokenAccount] = this.calculatePdaTokenAccounts(operationDataPda);
 
         // 构建remaining accounts
-        const remainingAccounts = [
-            // Programs
-            TOKEN_PROGRAM_ID,
-            this.poolConfig.clmmProgramId,
-            new PublicKey("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"),
-            new PublicKey("MemoSq4gqABAX3b7cqRUpy4U5M1ZcvTd5Z73s3J6"),
-            user.publicKey,
-
-            // Raydium accounts
-            this.poolConfig.poolState,
-            this.poolConfig.ammConfig,
-            this.poolConfig.observationState,
-            this.poolConfig.tokenVault0,
-            this.poolConfig.tokenVault1,
-            this.poolConfig.tokenMint0,
-            this.poolConfig.tokenMint1,
-
-            // Tick arrays
-            tickArrayLower,
-            tickArrayUpper,
-
-            // Positions
-            protocolPosition,
-            personalPosition,
-
-            // Operation data PDA
-            operationDataPda,
-
-            // PDA token accounts
-            inputTokenAccount,
-            outputTokenAccount,
-
-            // Position NFT
-            positionNftAccount,
-
-            // Recipient token account
-            recipientTokenAccount,
-        ];
+        const remainingAccounts = this.buildRemainingAccounts(user, nftMint, tickLower, tickUpper);
 
         console.log("Claim accounts prepared, executing...");
 
         // 执行claim
-        const tx = await this.claim(transferId, params, user, remainingAccounts);
+        const tx = await this.claim(params, user, nftMint, remainingAccounts);
 
         console.log("Claim completed:", tx);
         return tx;
+    }
+
+    /**
+     * 验证claim前置条件
+     */
+    async validateClaimPreconditions(
+        user: Keypair,
+        nftMint: PublicKey
+    ): Promise<boolean> {
+        try {
+            // 检查NFT账户是否存在
+            const nftAccount = PublicKey.findAssociatedTokenAddressSync(
+                user.publicKey,
+                nftMint
+            );
+
+            const nftAccountInfo = await this.provider.connection.getAccountInfo(nftAccount);
+            if (!nftAccountInfo) {
+                console.log("NFT account does not exist");
+                return false;
+            }
+
+            // 检查接收账户是否存在
+            const recipientAccount = PublicKey.findAssociatedTokenAddressSync(
+                user.publicKey,
+                this.poolConfig.tokenMint0
+            );
+
+            const recipientAccountInfo = await this.provider.connection.getAccountInfo(recipientAccount);
+            if (!recipientAccountInfo) {
+                console.log("Recipient account does not exist");
+                return false;
+            }
+
+            console.log("✓ Claim preconditions validated");
+            return true;
+        } catch (error) {
+            console.log("✗ Claim preconditions validation failed:", error.message);
+            return false;
+        }
+    }
+
+    /**
+     * 获取claim事件
+     */
+    async getClaimEvents(txSignature: string): Promise<any[]> {
+        try {
+            const tx = await this.provider.connection.getTransaction(txSignature, {
+                commitment: 'confirmed',
+                maxSupportedTransactionVersion: 0
+            });
+
+            if (!tx || !tx.meta || !tx.meta.logMessages) {
+                return [];
+            }
+
+            // 解析事件日志
+            const events = [];
+            for (const log of tx.meta.logMessages) {
+                if (log.includes('ClaimEvent')) {
+                    // 这里需要根据实际的事件格式来解析
+                    events.push(log);
+                }
+            }
+
+            return events;
+        } catch (error) {
+            console.log("Error getting claim events:", error.message);
+            return [];
+        }
     }
 }

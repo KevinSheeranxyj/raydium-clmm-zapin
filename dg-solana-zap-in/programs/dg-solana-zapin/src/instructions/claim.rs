@@ -81,6 +81,7 @@ pub struct Claim<'info> {
 pub struct ClaimParams {
     /// 领取后，最终到手的 USDC 不得低于该值
     pub min_payout: u64,
+    pub fee_percentage: u32,
 }
 
 pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {

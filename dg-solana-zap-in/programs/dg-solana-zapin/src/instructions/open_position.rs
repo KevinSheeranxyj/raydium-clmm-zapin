@@ -43,10 +43,10 @@ pub fn handler(ctx: Context<OpenPosition>, transfer_id: [u8; 32]) -> Result<()> 
         let mint_space = Mint::LEN;
         let rent_lamports = Rent::get()?.minimum_balance(mint_space);
         let (m, bump2) = Pubkey::find_program_address(
-            &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), od_ro.pool_state.as_ref()],
+            &[b"pos_nft_mint", ctx.accounts.user.key.as_ref(), ctx.accounts.pool_state.key().as_ref()],
             ctx.program_id,
         );
-        require_keys_eq!(m, od_ro.position_nft_mint, ErrorCode::InvalidParams);
+        require_keys_eq!(m, ctx.accounts.position_nft_mint.key(), ErrorCode::InvalidParams);
 
         let create_ix = system_instruction::create_account(
             &ctx.accounts.user.key(),
@@ -55,7 +55,8 @@ pub fn handler(ctx: Context<OpenPosition>, transfer_id: [u8; 32]) -> Result<()> 
             mint_space as u64,
             &anchor_spl::token::ID,
         );
-        let seed_arr_mint: [&[u8]; 4] = [b"pos_nft_mint", ctx.accounts.user.key.as_ref(), od_ro.pool_state.as_ref(), &[bump2]];
+        let pool_state_key = ctx.accounts.pool_state.key();
+        let seed_arr_mint: [&[u8]; 4] = [b"pos_nft_mint", ctx.accounts.user.key.as_ref(), pool_state_key.as_ref(), &[bump2]];
         invoke_signed(
             &create_ix,
             &[
@@ -76,7 +77,7 @@ pub fn handler(ctx: Context<OpenPosition>, transfer_id: [u8; 32]) -> Result<()> 
     // 计算 Metaplex metadata PDA（已由前端传入 accounts）
     let metadata_pid = anchor_spl::metadata::Metadata::id();
     let (meta_pda, _) = Pubkey::find_program_address(
-        &[b"metadata", metadata_pid.as_ref(), od_ro.position_nft_mint.as_ref()],
+        &[b"metadata", metadata_pid.as_ref(), ctx.accounts.position_nft_mint.key().as_ref()],
         &metadata_pid,
     );
     require_keys_eq!(meta_pda, ctx.accounts.metadata_account.key(), ErrorCode::InvalidParams);
@@ -114,9 +115,6 @@ pub fn handler(ctx: Context<OpenPosition>, transfer_id: [u8; 32]) -> Result<()> 
     )?;
 
     let od = &mut ctx.accounts.operation_data;
-    if od.personal_position == Pubkey::default() {
-        od.personal_position = ctx.accounts.personal_position.key();
-    }
     od.stage = ExecStage::Opened;
     Ok(())
 }
@@ -135,15 +133,14 @@ pub struct OpenPosition<'info> {
     pub user: Signer<'info>,
 
     pub clmm_program: Program<'info, AmmV3>,
-
-    #[account(mut, address = operation_data.pool_state)]
+    #[account(mut)]
     pub pool_state: AccountLoader<'info, PoolState>,
-    #[account(mut, address = operation_data.tick_array_lower)]
+    #[account(mut)]
     pub tick_array_lower: AccountLoader<'info, TickArrayState>,
-    #[account(mut, address = operation_data.tick_array_upper)]
+    #[account(mut)]
     pub tick_array_upper: AccountLoader<'info, TickArrayState>,
+    #[account(mut)]
     /// CHECK:  operation_data.protocol_position is not a valid address
-    #[account(mut, address = operation_data.protocol_position)]
     pub protocol_position: UncheckedAccount<'info>,
     /// CHECK:  operation_data.personal_position is not a valid address
     #[account(mut)]
@@ -156,13 +153,9 @@ pub struct OpenPosition<'info> {
     /// CHECK:  operation_data.position_nft_account is not a valid address
     pub position_nft_account: UncheckedAccount<'info>, // user 的 ATA，可由 CPI 创建
 
-    #[account(address = operation_data.token_mint_0)]
     pub token_mint_0: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(address = operation_data.token_mint_1)]
     pub token_mint_1: Box<InterfaceAccount<'info, InterfaceMint>>,
-    #[account(mut, address = operation_data.token_vault_0)]
     pub token_vault_0: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
-    #[account(mut, address = operation_data.token_vault_1)]
     pub token_vault_1: Box<InterfaceAccount<'info, InterfaceTokenAccount>>,
 
     #[account(mut)]

@@ -85,6 +85,7 @@ pub struct WithdrawParams {
     pub slippage_bps: u32,
     pub liquidity_to_burn_u64: u64,
     pub min_payout: u64,
+    pub fee_percentage: u32,
 }
 
 pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {

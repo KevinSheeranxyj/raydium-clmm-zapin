@@ -7,6 +7,7 @@ use raydium_amm_v3::libraries::U256;
 use raydium_amm_v3::libraries::MulDiv;
 use crate::errors::ErrorCode;
 use anchor_lang::solana_program::program_pack::Pack;
+use anchor_lang::solana_program::keccak::hash;
 const Q64_U128: u128 = 1u128 << 64;
 
 #[inline(never)]
@@ -306,7 +307,7 @@ pub fn amounts_from_liquidity_burn_q64(
 
 /// 将 transfer_id 字符串转换为 32 字节哈希
 pub fn transfer_id_hash_bytes(transfer_id: &str) -> [u8; 32] {
-    let hash = anchor_lang::solana_program::keccak::hash(transfer_id.as_bytes());
+    let hash = hash(transfer_id.as_bytes());
     hash.to_bytes()
 }
 
