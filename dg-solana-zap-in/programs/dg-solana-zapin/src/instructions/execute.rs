@@ -38,6 +38,8 @@ const Q64_U128: u128 = 1u128 << 64;
 /// # Events
 /// Emits execution events for tracking
 #[inline(never)]
+/// Params:
+/// - transfer_id: 32-byte identifier of the previously deposited operation
 pub fn handler(mut ctx: Context<crate::Execute>, transfer_id: [u8; 32]) -> Result<()> {
     msg!("DEBUG: Execute handler started");
     msg!("DEBUG: transfer_id: {:?}", transfer_id);

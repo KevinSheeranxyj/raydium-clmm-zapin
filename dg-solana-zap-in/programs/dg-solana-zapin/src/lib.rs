@@ -53,6 +53,16 @@ pub mod dg_solana_zapin {
     use super::*;
 
     // Initialize the PDA and set the authority
+    /// Initialize global program state:
+    /// - Creates/updates `operation_data` PDA and sets its authority
+    /// - Initializes global `config` with the `fee_receiver`
+    ///
+    /// Accounts:
+    /// - operation_data (PDA)
+    /// - authority (signer)
+    /// - config (PDA)
+    /// - fee_receiver (unchecked)
+    /// - system_program
     pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
         let od = &mut ctx.accounts.operation_data;
         if !od.initialized {
@@ -70,7 +80,18 @@ pub mod dg_solana_zapin {
         Ok(())
     }
 
-    // Deposit transfer details into PDA
+    /// Deposit transfer details into PDA:
+    /// - Transfers funds from `authority_ata` to program-owned token account
+    /// - Stores `transfer_id`, `operation_type`, and serialized action params
+    /// - Records an authorized executor for later `execute`
+    ///
+    /// Params:
+    /// - transfer_id: unique 32-byte operation id
+    /// - operation_type: ZapIn or Transfer
+    /// - action: serialized params (Anchor borsh layout)
+    /// - amount: amount to deposit
+    /// - ca: contract address (pool or target address)
+    /// - authorized_executor: who is allowed to call `execute`
     pub fn deposit(
         ctx: Context<Deposit>,
         transfer_id: [u8; 32],
@@ -140,19 +161,31 @@ pub mod dg_solana_zapin {
         emit!(ExecutorAssigned { transfer_id_hex: to_hex32(&transfer_id), executor: od.executor });
         Ok(())
     }
+    /// Execute the previously deposited operation identified by `transfer_id`:
+    /// - Validates state and accounts
+    /// - Performs swap/open_position/increase_liquidity for ZapIn
+    /// - Marks operation as executed
     pub fn execute(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
         instructions::execute::handler(ctx, transfer_id)
     }
 
+    /// Withdraw (ZapOut-like) from an existing CLMM position:
+    /// - Burns liquidity and optionally single-side swaps
+    /// - Enforces minimum payout and takes protocol fee to `fee_receiver`
     pub fn withdraw(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
         instructions::withdraw::handler(ctx, p)
     }
 
+    /// Claim accrued fees from a CLMM position and deliver to user:
+    /// - Settles fees, optionally swaps to the desired token
+    /// - Enforces minimum payout and takes protocol fee to `fee_receiver`
     pub fn claim(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         instructions::claim::handler(ctx, p)
     }
 
     // Modify PDA Authority
+    /// Update the `operation_data` PDA authority to a new pubkey.
+    /// Requires the current authority to sign.
     pub fn modify_pda_authority(
         ctx: Context<ModifyPdaAuthority>,
         new_authority: Pubkey,

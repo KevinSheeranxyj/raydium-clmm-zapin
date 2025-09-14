@@ -98,6 +98,17 @@ pub struct WithdrawParams {
     pub fee_percentage: u32,
 }
 
+/// Withdraw handler (ZapOut-like):
+/// - Burns specified or full liquidity from the user's CLMM position
+/// - Optionally swaps single-sided to the desired token (base/quote)
+/// - Enforces min payout and transfers protocol fee to `fee_receiver_ata`
+///
+/// Params:
+/// - want_base: when true, receive token0; when false, receive token1
+/// - slippage_bps: slippage tolerance in basis points (1e4 = 100%)
+/// - liquidity_to_burn_u64: liquidity to burn (0 means burn all)
+/// - min_payout: minimum amount of desired token the user must receive
+/// - fee_percentage: protocol fee in basis points (1e4 = 100%)
 pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let user_key = ctx.accounts.user.key();
     

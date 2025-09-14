@@ -94,6 +94,14 @@ pub struct ClaimParams {
     pub fee_percentage: u32,
 }
 
+/// Claim handler:
+/// - Settles accrued fees for the provided CLMM position
+/// - Optionally swaps the non-recipient side to the recipient mint
+/// - Checks min payout and transfers protocol fee to `fee_receiver_ata`
+///
+/// Params:
+/// - min_payout: minimum amount of recipient mint the user must receive
+/// - fee_percentage: protocol fee in basis points (1e4 = 100%)
 pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     let user_key = ctx.accounts.user.key();
     
