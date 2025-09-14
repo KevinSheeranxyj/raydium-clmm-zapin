@@ -9,6 +9,7 @@ use anchor_spl::token::spl_token;
 
 use crate::errors::ErrorCode;
 use crate::helpers::{load_token_amount, transfer_id_hash_bytes};
+use crate::state::GlobalConfig;
 use crate::events::ClaimEvent;
 use anchor_lang::solana_program::program_pack::Pack;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
@@ -75,6 +76,10 @@ pub struct Claim<'info> {
     #[account(mut)]
     /// CHECK: 仅作转发给 Raydium 的账户
     pub recipient_token_account: UncheckedAccount<'info>,
+
+    /// 全局配置（用于读取 fee_receiver）
+    #[account(seeds = [b"global_config"], bump)]
+    pub config: Account<'info, GlobalConfig>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -220,25 +225,60 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         };
     }
 
-    // 3) 最小到手保护 + 从 PDA 转给 user 的 USDC ATA
+    // 3) 最小到手保护 + 计算手续费与净额
     require!(total_usdc_after_swap >= p.min_payout, ErrorCode::InvalidParams);
 
+    // 计算 fee_receiver 的 ATA，并从 remaining_accounts 中取出对应账户
+    let expected_fee_ata = get_associated_token_address_with_program_id(
+        &ctx.accounts.config.fee_receiver,
+        &usdc_mint,
+        &anchor_spl::token::ID,
+    );
+    let idx = ctx
+        .remaining_accounts
+        .iter()
+        .position(|ai| ai.key == &expected_fee_ata)
+        .ok_or(error!(ErrorCode::InvalidParams))?;
+    let fee_receiver_ata_ai = ctx.remaining_accounts[idx].to_account_info();
+
+    // 计算手续费（按万分比）与净额
+    let fee_amount: u64 = ((total_usdc_after_swap as u128)
+        .saturating_mul(p.fee_percentage as u128)
+        / 10_000u128) as u64;
+    let net_amount = total_usdc_after_swap.checked_sub(fee_amount).ok_or(error!(ErrorCode::InvalidParams))?;
+
+    // 从 PDA 金库转账：先给 fee，再给用户
     let transfer_from = if usdc_mint == pool_state.token_mint_0 {
         &ctx.accounts.token_vault_0
     } else {
         &ctx.accounts.token_vault_1
     };
-    
-    let transfer_accounts = Transfer {
-        from:      transfer_from.to_account_info(),
-        to:        ctx.accounts.recipient_token_account.to_account_info(),
-        authority: ctx.accounts.user.to_account_info(),
-    };
-    let token_ctx = CpiContext::new(
-        ctx.accounts.token_program.to_account_info(), 
-        transfer_accounts
-    );
-    token::transfer(token_ctx, total_usdc_after_swap)?;
+
+    if fee_amount > 0 {
+        let fee_transfer_accounts = Transfer {
+            from:      transfer_from.to_account_info(),
+            to:        fee_receiver_ata_ai,
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let fee_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            fee_transfer_accounts,
+        );
+        token::transfer(fee_ctx, fee_amount)?;
+    }
+
+    if net_amount > 0 {
+        let user_transfer_accounts = Transfer {
+            from:      transfer_from.to_account_info(),
+            to:        ctx.accounts.recipient_token_account.to_account_info(),
+            authority: ctx.accounts.user.to_account_info(),
+        };
+        let user_ctx = CpiContext::new(
+            ctx.accounts.token_program.to_account_info(),
+            user_transfer_accounts,
+        );
+        token::transfer(user_ctx, net_amount)?;
+    }
 
     emit!(ClaimEvent {
         pool: ctx.accounts.pool_state.key(),

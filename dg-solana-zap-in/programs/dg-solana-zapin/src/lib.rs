@@ -1,6 +1,7 @@
 use anchor_lang::prelude::*;
+use anchor_lang::system_program::System;
 
-declare_id!("DisiSrRg8fWzsy8UXAGwh8VobnCTTg1uiC6iKSNaBrYL");
+declare_id!("2h2KDqUHkHf7DVUd3SJCeEPPLMLiYuviojp3YFJgMnZN");
 
 pub mod instructions;
 pub mod errors;
@@ -39,7 +40,7 @@ use crate::errors::ErrorCode;
 
 
 use crate::helpers::{to_hex32, deserialize_params, tick_array_start_index};
-use crate::state::{ExecStage, OperationType, TransferParams, ZapInParams, Registry};
+use crate::state::{ExecStage, OperationType, TransferParams, ZapInParams, Registry, GlobalConfig};
 use crate::events::{DepositEvent, ExecutorAssigned};
 
 // Devnet: DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH
@@ -61,6 +62,11 @@ pub mod dg_solana_zapin {
         } else {
             msg!("PDA already initialized; authority: {}", od.authority);
         }
+
+        // Initialize or update global config
+        let cfg = &mut ctx.accounts.config;
+        cfg.authority = ctx.accounts.authority.key();
+        cfg.fee_receiver = ctx.accounts.fee_receiver.key();
         Ok(())
     }
 
@@ -127,28 +133,8 @@ pub mod dg_solana_zapin {
         Ok(())
     }
 
-    pub fn prepare_execute(ctx: Context<PrepareExecute>, transfer_id: [u8;32]) -> Result<()> {
-        instructions::prepare_execute::handler(ctx, transfer_id)
-    }
-
-    pub fn swap_for_balance(ctx: Context<SwapForBalance>, transfer_id: [u8;32]) -> Result<()> {
-        instructions::swap_for_balance::handler(ctx, transfer_id)
-    }
-
-    pub fn open_position(ctx: Context<OpenPosition>, transfer_id: [u8;32]) -> Result<()> {
-        instructions::open_position::handler(ctx, transfer_id)
-    }
-
-    pub fn increase_liquidity(ctx: Context<IncreaseLiquidity>, transfer_id: [u8;32]) -> Result<()> {
-        instructions::increase_liquidity::handler(ctx, transfer_id)
-    }
-
-    pub fn finalize_execute(ctx: Context<FinalizeExecute>, transfer_id: [u8;32]) -> Result<()> {
-        instructions::finalize_execute::handler(ctx, transfer_id)
-    }
-
-    pub fn cancel(ctx: Context<Cancel>, transfer_id: [u8;32]) -> Result<()> {
-        instructions::cancel::handler(ctx, transfer_id)
+    pub fn execute(ctx: Context<Execute>, transfer_id: [u8;32]) -> Result<()> {
+        instructions::execute::handler(ctx, transfer_id)
     }
 
     // Withdraw instruction
@@ -183,6 +169,72 @@ pub mod dg_solana_zapin {
 }
 
 #[derive(Accounts)]
+pub struct Execute<'info> {
+    #[account(mut,
+        seeds = [b"operation_data".as_ref(), operation_data.transfer_id.as_ref()],
+        bump
+    )]
+    pub operation_data: Account<'info, OperationData>,
+    /// Caller authorized to execute
+    pub caller: Signer<'info>,
+
+    // Program-owned token accounts
+    #[account(mut)]
+    pub program_token_account: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub pda_token0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub pda_token1: Account<'info, TokenAccount>,
+
+    // Raydium CPI program
+    pub clmm_program: Program<'info, AmmV3>,
+
+    // Raydium pool/position accounts (Unchecked to allow external program layout)
+    /// CHECK: forwarded to Raydium
+    pub pool_state: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub amm_config: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub observation_state: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub protocol_position: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub personal_position: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub tick_array_lower: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub tick_array_upper: UncheckedAccount<'info>,
+
+    // Position NFT
+    /// CHECK: forwarded to Raydium
+    pub position_nft_mint: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub position_nft_account: UncheckedAccount<'info>,
+
+    // Token vaults and mints
+    /// CHECK: forwarded to Raydium
+    pub token_vault_0: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub token_vault_1: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub token_mint_0: UncheckedAccount<'info>,
+    /// CHECK: forwarded to Raydium
+    pub token_mint_1: UncheckedAccount<'info>,
+
+    // Programs & sysvars
+    pub token_program: Program<'info, Token>,
+    pub token_program_2022: Program<'info, Token2022>,
+    /// CHECK: memo program
+    pub memo_program: UncheckedAccount<'info>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    /// CHECK: metadata program
+    pub metadata_program: UncheckedAccount<'info>,
+    /// CHECK: metadata account
+    pub metadata_account: UncheckedAccount<'info>,
+}
+#[derive(Accounts)]
 pub struct Initialize<'info> {
     #[account(
         init_if_needed,
@@ -196,6 +248,16 @@ pub struct Initialize<'info> {
     pub authority: Signer<'info>,
     /// CHECK: solver admin
     pub set_solver: UncheckedAccount<'info>, 
+    /// 全局配置 PDA
+    #[account(
+        init_if_needed,
+        payer = authority,
+        space = 8 + GlobalConfig::LEN,
+        seeds = [b"global_config"],
+        bump
+    )]
+    pub config: Account<'info, GlobalConfig>,
+    pub fee_receiver: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
 #[account]
@@ -230,7 +292,7 @@ impl OperationData {
             + 32 // transfer_id
             + 32 // recipient
             + 1  // operation_type (enum tag)
-            + (4 + 256) // action: 4字节长度 + 预留 256
+            + (4 + 1024) // action: 4字节长度 + 预留 1024 bytes
             + 8  // amount
             + 1  // executed
             + 32 // ca
