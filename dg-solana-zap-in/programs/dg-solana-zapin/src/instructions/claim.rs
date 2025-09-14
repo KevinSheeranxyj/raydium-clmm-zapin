@@ -16,75 +16,80 @@ use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 
 #[derive(Accounts)]
 pub struct Claim<'info> {
-    /// CHECK: 仅作转发给 Raydium 的 nft_owner（不要求签名）
+    /// CHECK: Forwarded to Raydium as nft_owner (no signature required)
     pub user: UncheckedAccount<'info>,
 
     /// CHECK: spl-memo
     #[account(address = spl_memo::id())]
     pub memo_program: UncheckedAccount<'info>,
 
-    // Raydium CLMM 程序
+    // Raydium CLMM program
     #[account(constraint = clmm_program.key() == crate::RAYDIUM_CLMM_PROGRAM_ID)]
     pub clmm_program: Program<'info, AmmV3>,
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
 
-    // Raydium CLMM 账户 - 使用 UncheckedAccount
+    // Raydium CLMM accounts - UncheckedAccount passthrough
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub pool_state: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub amm_config: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub observation_state: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub protocol_position: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub personal_position: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub tick_array_lower: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub tick_array_upper: UncheckedAccount<'info>,
 
-    // Token 账户
+    // Token accounts
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_vault_0: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_vault_1: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_mint_0: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_mint_1: UncheckedAccount<'info>,
 
-    // 用户 NFT 账户
+    // User NFT account
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub nft_account: UncheckedAccount<'info>,
 
-    // 用户接收账户
+    // User recipient account
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub recipient_token_account: UncheckedAccount<'info>,
 
-    /// 全局配置（用于读取 fee_receiver）
+    /// Global config (to read fee_receiver)
     #[account(seeds = [b"global_config"], bump)]
     pub config: Account<'info, GlobalConfig>,
+
+    // Explicit fee receiver ATA passed in to avoid remaining_accounts lifetimes
+    #[account(mut)]
+    /// CHECK: validated against expected ATA in handler
+    pub fee_receiver_ata: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
 pub struct ClaimParams {
-    /// 领取后，最终到手的 USDC 不得低于该值
+    /// Minimum USDC the user must receive after claiming
     pub min_payout: u64,
     pub fee_percentage: u32,
 }
@@ -92,7 +97,7 @@ pub struct ClaimParams {
 pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     let user_key = ctx.accounts.user.key();
     
-    // 解析账户数据
+    // Parse account data
     let pool_state_data = ctx.accounts.pool_state.try_borrow_data()?;
     let pool_state = PoolState::try_deserialize(&mut &pool_state_data[..])?;
     
@@ -102,46 +107,46 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
     let recipient_info = spl_token::state::Account::unpack(&recipient_data)?;
 
-    // 验证用户NFT账户
+    // Validate user's NFT account
     let nft_account_data = ctx.accounts.nft_account.try_borrow_data()?;
     let nft_account_info = spl_token::state::Account::unpack(&nft_account_data)?;
     require!(nft_account_info.owner == user_key, ErrorCode::Unauthorized);
     require!(nft_account_info.mint == personal_position.nft_mint, ErrorCode::InvalidMint);
 
-    // 验证接收账户
+    // Validate recipient account
     require!(recipient_info.owner == user_key, ErrorCode::Unauthorized);
     require!(recipient_info.mint == pool_state.token_mint_0 || recipient_info.mint == pool_state.token_mint_1, ErrorCode::InvalidMint);
 
     let usdc_mint = recipient_info.mint;
 
-    // 创建PDA用于接收代币
-    let (pda, bump) = Pubkey::find_program_address(
+    // Create PDA to receive tokens
+    let (pda, _bump) = Pubkey::find_program_address(
         &[b"claim_pda", user_key.as_ref(), &personal_position.nft_mint.to_bytes()],
         &crate::ID,
     );
 
-    // 创建PDA的token账户
-    let pda_token_account_0 = get_associated_token_address_with_program_id(
+    // Create PDA's token accounts
+    let _pda_token_account_0 = get_associated_token_address_with_program_id(
         &pda,
         &pool_state.token_mint_0,
         &anchor_spl::token::ID,
     );
-    let pda_token_account_1 = get_associated_token_address_with_program_id(
+    let _pda_token_account_1 = get_associated_token_address_with_program_id(
         &pda,
         &pool_state.token_mint_1,
         &anchor_spl::token::ID,
     );
 
-    // 记录 claim 前余额（PDA 名下两边）
+    // Record balances before claim (on both PDA vaults)
     let pre0 = load_token_amount(&ctx.accounts.token_vault_0)?;
     let pre1 = load_token_amount(&ctx.accounts.token_vault_1)?;
     let pre_usdc = if usdc_mint == pool_state.token_mint_0 { pre0 } else { pre1 };
 
     // seeds
     let signer_seeds_slice: [&[u8]; 3] = [b"claim_pda".as_ref(), user_key.as_ref(), &personal_position.nft_mint.to_bytes()];
-    let signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
+    let _signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
 
-    // 1) 只结算手续费（liquidity=0）
+    // 1) Settle fees only (liquidity=0)
     {
         let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
             nft_owner:                 ctx.accounts.user.to_account_info(),
@@ -168,7 +173,7 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         cpi::decrease_liquidity_v2(dec_ctx, 0u128, 0u64, 0u64)?;
     }
 
-    // 刚领取到 PDA 的手续费数量
+    // Fees just claimed to the PDA
     let post0 = load_token_amount(&ctx.accounts.token_vault_0)?;
     let post1 = load_token_amount(&ctx.accounts.token_vault_1)?;
     let got0 = post0.checked_sub(pre0).ok_or(error!(ErrorCode::InvalidParams))?;
@@ -178,7 +183,7 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         return Ok(());
     }
 
-    // 2) 将非 USDC 一侧全量 swap 成 USDC
+    // 2) Swap the non-USDC side fully into USDC
     let mut total_usdc_after_swap = if usdc_mint == pool_state.token_mint_0 { pre_usdc + got0 } else { pre_usdc + got1 };
     if (usdc_mint == pool_state.token_mint_0 && got1 > 0) || (usdc_mint == pool_state.token_mint_1 && got0 > 0) {
         let (in_vault, out_vault, in_mint, out_mint, is_base_input, amount_in) =
@@ -217,7 +222,7 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         );
         cpi::swap_v2(swap_ctx, amount_in, 0, 0, is_base_input)?;
 
-        // 刷新 USDC 余额
+        // Refresh USDC balance
         total_usdc_after_swap = if usdc_mint == pool_state.token_mint_0 {
             load_token_amount(&ctx.accounts.token_vault_0)?
         } else {
@@ -225,29 +230,24 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         };
     }
 
-    // 3) 最小到手保护 + 计算手续费与净额
+    // 3) Min received protection + compute fee and net
     require!(total_usdc_after_swap >= p.min_payout, ErrorCode::InvalidParams);
 
-    // 计算 fee_receiver 的 ATA，并从 remaining_accounts 中取出对应账户
+    // Compute expected fee_receiver ATA and validate the passed account
     let expected_fee_ata = get_associated_token_address_with_program_id(
         &ctx.accounts.config.fee_receiver,
         &usdc_mint,
         &anchor_spl::token::ID,
     );
-    let idx = ctx
-        .remaining_accounts
-        .iter()
-        .position(|ai| ai.key == &expected_fee_ata)
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    let fee_receiver_ata_ai = ctx.remaining_accounts[idx].to_account_info();
+    require!(ctx.accounts.fee_receiver_ata.key() == expected_fee_ata, ErrorCode::InvalidParams);
 
-    // 计算手续费（按万分比）与净额
+    // Compute fee (basis points) and net amount
     let fee_amount: u64 = ((total_usdc_after_swap as u128)
         .saturating_mul(p.fee_percentage as u128)
         / 10_000u128) as u64;
     let net_amount = total_usdc_after_swap.checked_sub(fee_amount).ok_or(error!(ErrorCode::InvalidParams))?;
 
-    // 从 PDA 金库转账：先给 fee，再给用户
+    // Transfer from PDA vault: fee first, then user
     let transfer_from = if usdc_mint == pool_state.token_mint_0 {
         &ctx.accounts.token_vault_0
     } else {
@@ -257,7 +257,7 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     if fee_amount > 0 {
         let fee_transfer_accounts = Transfer {
             from:      transfer_from.to_account_info(),
-            to:        fee_receiver_ata_ai,
+            to:        ctx.accounts.fee_receiver_ata.to_account_info(),
             authority: ctx.accounts.user.to_account_info(),
         };
         let fee_ctx = CpiContext::new(

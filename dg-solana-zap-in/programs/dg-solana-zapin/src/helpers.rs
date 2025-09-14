@@ -7,7 +7,7 @@ use anchor_spl::token::spl_token;
 use raydium_amm_v3::libraries::{U256, MulDiv, tick_math};
 use raydium_amm_v3::states::{PoolState, FEE_RATE_DENOMINATOR_VALUE, AmmConfig};
 use crate::errors::ErrorCode;
-use crate::state::ZapInParams;
+use crate::state::{ZapInParams, ActionData};
 use crate::Execute;
 use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::solana_program::keccak::hash;
@@ -119,7 +119,7 @@ pub fn do_open_position_v2<'a>(
         0u128,
         0u64,
         0u64,
-        false,          // with_metadata（Raydium 会基于传入 metadata PDA 处理）
+        false,          // with_metadata (Raydium will use provided metadata PDA)
         Some(true),     // base_flag
     )
 }
@@ -176,12 +176,12 @@ pub fn load_token_amount(ai: &AccountInfo) -> Result<u64> {
     Ok(acc.amount)
 }
 
-const TICK_ARRAY_SIZE: i32 = 88; //Raydium/UniV3 每个 TickArray 覆盖 88 个 tick 间隔
+const TICK_ARRAY_SIZE: i32 = 88; // Raydium/UniV3 each TickArray spans 88 tick intervals
 
 #[inline]
 pub fn tick_array_start_index(tick_index: i32, tick_spacing: i32) -> i32 {
     let span = tick_spacing * TICK_ARRAY_SIZE;
-    // floor 除法，处理负 tick
+    // Floor division, handling negative ticks
     let q = if tick_index >= 0 {
         tick_index / span
     } else {
@@ -308,13 +308,13 @@ pub fn amounts_from_liquidity_burn_q64(
     (amount0, amount1)
 }
 
-/// 将 transfer_id 字符串转换为 32 字节哈希
+/// Convert transfer_id string into 32-byte hash
 pub fn transfer_id_hash_bytes(transfer_id: &str) -> [u8; 32] {
     let hash = hash(transfer_id.as_bytes());
     hash.to_bytes()
 }
 
-/// 执行 open_position 操作
+/// Execute open_position operation
 #[inline(never)]
 pub fn execute_open_position(
     ctx: &Context<Execute>,
@@ -324,11 +324,11 @@ pub fn execute_open_position(
 ) -> Result<()> {
     msg!("DEBUG: About to start open_position logic");
     
-    // 计算 tick array 起始索引
+    // Compute tick array start indices
     let lower_start = tick_array_start_index(p.tick_lower, pool_state.tick_spacing as i32);
     let upper_start = tick_array_start_index(p.tick_upper, pool_state.tick_spacing as i32);
     
-    // 使用 helper 函数调用 Raydium open_position_v2
+    // Call Raydium open_position_v2 via helper
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
         transfer_id.as_ref(),
@@ -371,7 +371,7 @@ pub fn execute_open_position(
     Ok(())
 }
 
-/// 计算流动性数量
+/// Calculate liquidity amounts
 #[inline]
 pub fn calculate_liquidity_amounts(
     p: &ZapInParams,
@@ -384,7 +384,7 @@ pub fn calculate_liquidity_amounts(
     }
 }
 
-/// 执行 increase_liquidity 操作
+/// Execute increase_liquidity operation
 #[inline(never)]
 pub fn execute_increase_liquidity(
     ctx: &Context<Execute>,
@@ -394,10 +394,10 @@ pub fn execute_increase_liquidity(
 ) -> Result<()> {
     msg!("DEBUG: About to start increase_liquidity logic");
     
-    // 计算流动性数量
+    // Compute liquidity amounts
     let (pre0, pre1) = calculate_liquidity_amounts(p, is_base_input)?;
     
-    // 使用 helper 函数调用 Raydium increase_liquidity_v2
+    // Use helper function to call Raydium increase_liquidity_v2
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
         transfer_id.as_ref(),
@@ -431,7 +431,7 @@ pub fn execute_increase_liquidity(
     Ok(())
 }
 
-/// 完成执行操作
+/// Finalize execute operation
 #[inline]
 pub fn finalize_execute(
     ctx: &mut Context<Execute>,
@@ -439,7 +439,7 @@ pub fn finalize_execute(
 ) -> Result<()> {
     msg!("DEBUG: About to finalize execution");
     
-    // 标记为已执行
+    // Mark as executed
     ctx.accounts.operation_data.executed = true;
     
     msg!("DEBUG: Execution finalized successfully");
@@ -457,7 +457,7 @@ pub fn deserialize_transfer_params_anchor(data: &[u8]) -> anchor_lang::Result<cr
     
     msg!("DEBUG: TransferParams Anchor data - first 32 bytes: {:?}", &data[..data.len().min(32)]);
     
-    // 找到实际数据的结束位置（第一个非零字节之后的所有零字节）
+    // Find the end of the actual data (trim trailing zero bytes after the last non-zero)
     let mut actual_len = data.len();
     for (i, &byte) in data.iter().enumerate().rev() {
         if byte != 0 {
@@ -468,10 +468,10 @@ pub fn deserialize_transfer_params_anchor(data: &[u8]) -> anchor_lang::Result<cr
     
     msg!("DEBUG: TransferParams Anchor actual data len: {}", actual_len);
     
-    // 只反序列化实际使用的数据部分
+    // Only deserialize the actually used data segment
     let actual_data = &data[..actual_len];
     
-    // 使用 Anchor 反序列化
+    // Deserialize using Anchor
     match crate::state::TransferParams::try_from_slice(actual_data) {
         Ok(params) => {
             msg!("DEBUG: TransferParams Anchor deserialized successfully");
@@ -484,7 +484,7 @@ pub fn deserialize_transfer_params_anchor(data: &[u8]) -> anchor_lang::Result<cr
     }
 }
 
-/// 验证操作状态
+/// Validate operation state
 #[inline(never)]
 pub fn validate_operation_state(
     operation_data: &OperationData,
@@ -510,7 +510,7 @@ pub fn validate_operation_state(
 }
 
 
-/// 执行完整的 ZapIn 流程
+/// Execute complete ZapIn flow
 #[inline(never)]
 pub fn execute_zap_in_flow(
     ctx: &mut Context<Execute>,
@@ -518,25 +518,25 @@ pub fn execute_zap_in_flow(
     p: &ZapInParams,
     transfer_amount: u64,
 ) -> Result<()> {
-    // 验证账户地址和执行 swap
+    // Validate account addresses and execute swap
     let is_base_input = validate_and_execute_swap(ctx, p)?;
     
-    // 执行 swap 操作
+    // Execute swap operation
     execute_swap_operation_wrapper(ctx, transfer_id, p, is_base_input, transfer_amount)?;
     
-    // 创建流动性头寸
+    // Create liquidity position
     execute_open_position_with_loading(ctx, transfer_id, p)?;
     
-    // 增加流动性
+    // Increase liquidity
     execute_increase_liquidity(ctx, transfer_id, p, is_base_input)?;
     
-    // 完成执行
+    // Finalize execution
     finalize_execute(ctx, transfer_id)?;
     
     Ok(())
 }
 
-/// 执行完整的 execute 流程
+/// Execute complete execute flow
 #[inline(never)]
 pub fn execute_complete_flow(
     ctx: &mut Context<Execute>,
@@ -545,21 +545,22 @@ pub fn execute_complete_flow(
     let caller_key = ctx.accounts.caller.key();
     msg!("DEBUG: caller_key: {}", caller_key);
     
-    // 1. 验证状态
+    // 1) Validate state
     validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
     
-    // 2. 根据操作类型执行相应流程
+    // 2) Execute flow based on operation type
     let amount = ctx.accounts.operation_data.amount;
-    // 从存储的 action 字节中反序列化为 ZapInParams
-    let params: ZapInParams = deserialize_params(&ctx.accounts.operation_data.action)?;
-    // 目前仅支持 ZapIn
-    require!(ctx.accounts.operation_data.operation_type == OperationType::ZapIn, ErrorCode::InvalidParams);
+    // Extract params from enum
+    let params = match &ctx.accounts.operation_data.action {
+        ActionData::ZapIn(p) => p.clone(),
+        _ => return Err(error!(ErrorCode::InvalidParams)),
+    };
     execute_zap_in_flow(ctx, transfer_id, &params, amount)?;
     
     Ok(())
 }
 
-/// 验证账户地址
+/// Validate account addresses
 #[inline(never)]
 pub fn validate_accounts_only(
     ctx: &Context<Execute>,
@@ -575,7 +576,7 @@ pub fn validate_accounts_only(
     )
 }
 
-/// 获取 is_base_input 标志
+/// Get is_base_input flag
 #[inline]
 pub fn get_is_base_input(
     ctx: &Context<Execute>,
@@ -586,20 +587,20 @@ pub fn get_is_base_input(
     Ok(is_base_input)
 }
 
-/// 紧凑的验证和执行函数
+/// Compact validation and execution function
 #[inline(never)]
 pub fn validate_and_execute_swap(
     ctx: &Context<Execute>,
     _p: &ZapInParams,
 ) -> Result<bool> {
-    // 验证账户地址
+    // Validate account addresses
     validate_accounts_only(ctx)?;
     
-    // 获取 is_base_input 标志
+    // Obtain is_base_input flag
     get_is_base_input(ctx)
 }
 
-/// 执行 swap 操作
+/// Execute swap operation
 #[inline(never)]
 pub fn execute_swap_operation_wrapper(
     ctx: &Context<Execute>,
@@ -611,6 +612,7 @@ pub fn execute_swap_operation_wrapper(
     let pool_state = parse_pool_state(&ctx.accounts.pool_state)?;
     let pool_state_data = pool_state.clone();
     
+    // Execute swap operation
     execute_swap_operation(
         ctx,
         transfer_id,
@@ -622,7 +624,7 @@ pub fn execute_swap_operation_wrapper(
     Ok(())
 }
 
-/// 执行 open_position 操作（带 pool_state 加载）
+/// Execute open_position operation (with pool_state loading)
 #[inline(never)]
 pub fn execute_open_position_with_loading(
     ctx: &Context<Execute>,
@@ -633,7 +635,7 @@ pub fn execute_open_position_with_loading(
     execute_open_position(ctx, transfer_id, p, &pool_state)
 }
 
-/// 解析 PoolState 数据
+/// Parse PoolState data
 #[inline]
 pub fn parse_pool_state(pool_state: &UncheckedAccount) -> Result<PoolState> {
     let pool_state_data = pool_state.try_borrow_data()?;
@@ -646,7 +648,7 @@ pub fn parse_amm_config(amm_config: &UncheckedAccount) -> Result<AmmConfig> {
     AmmConfig::try_deserialize(&mut &data[..])
 }
 
-/// 验证单个账户地址
+/// Validate a single account address
 #[inline]
 pub fn validate_single_account(
     account_key: &Pubkey,
@@ -659,7 +661,7 @@ pub fn validate_single_account(
     Ok(())
 }
 
-/// 验证账户地址是否匹配
+/// Validate whether account addresses match
 #[inline(never)]
 pub fn validate_account_addresses_unchecked(
     amm_config: &AccountInfo,
@@ -672,10 +674,10 @@ pub fn validate_account_addresses_unchecked(
 ) -> Result<()> {
     msg!("DEBUG: About to validate account addresses with UncheckedAccount");
     
-    // 手动解析 PoolState 数据
+    // Manually parse PoolState data
     let pool_state = parse_pool_state(pool_state)?;
     
-    // 验证各个账户地址
+    // Validate individual account addresses
     validate_single_account(&amm_config.key, &pool_state.amm_config, "amm_config")?;
     validate_single_account(&observation_state.key, &pool_state.observation_key, "observation_state")?;
     validate_single_account(&token_mint_0.key, &pool_state.token_mint_0, "token_mint_0")?;
@@ -723,7 +725,7 @@ pub fn validate_account_addresses(
     Ok(())
 }
 
-/// 执行 swap 操作
+/// Execute swap operation
 pub fn execute_swap_operation(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
@@ -734,11 +736,11 @@ pub fn execute_swap_operation(
 ) -> Result<()> {
     msg!("DEBUG: About to start swap operation");
     
-    // 计算 tick array 起始索引
+    // Compute tick array start indices
     let lower_start = tick_array_start_index(params.tick_lower, pool_state.tick_spacing as i32);
     let upper_start = tick_array_start_index(params.tick_upper, pool_state.tick_spacing as i32);
     
-    // 计算 tick array PDA 地址
+    // Compute tick array PDA addresses
     let pool_state_key = ctx.accounts.pool_state.key();
     let tick_array_lower_pda = Pubkey::find_program_address(
         &[
@@ -758,7 +760,7 @@ pub fn execute_swap_operation(
         &ctx.accounts.clmm_program.key,
     ).0;
     
-    // 转移资金到 PDA 账户
+    // Transfer funds to PDA account
     let cpi_accounts = Transfer {
         from: ctx.accounts.program_token_account.to_account_info(),
         to: ctx.accounts.pda_token0.to_account_info(),
@@ -773,7 +775,7 @@ pub fn execute_swap_operation(
     let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
     token::transfer(cpi_ctx, transfer_amount)?;
     
-    // 执行 swap 逻辑
+    // Perform swap logic
     execute_swap_logic(
         ctx,
         transfer_id,
@@ -787,7 +789,7 @@ pub fn execute_swap_operation(
     Ok(())
 }
 
-/// 执行 swap 逻辑的核心部分
+/// Core part of executing swap logic
 fn execute_swap_logic(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
@@ -797,23 +799,23 @@ fn execute_swap_logic(
     tick_array_lower_pda: &Pubkey,
     tick_array_upper_pda: &Pubkey,
 ) -> Result<()> {
-    // 平衡代币比例 (swap_for_balance 逻辑)
+    // Balance token ratios (swap_for_balance logic)
     let sp = pool_state.sqrt_price_x64;
-    // 解析 AmmConfig 数据
+    // Parse AmmConfig data
     let amm_cfg = parse_amm_config(&ctx.accounts.amm_config)?;
     
-    // 费率是 1e6 制（ppm）
+    // Fee rates are in ppm (1e6)
     let trade_fee_ppm: u32 = amm_cfg.trade_fee_rate.into();
     let protocol_fee_ppm: u32 = amm_cfg.protocol_fee_rate.into();
     
-    // 计算 min_out
+    // Compute min_out
     let sp_u = U256::from(sp);
     let q64_u = U256::from(Q64_U128);
     let price_q64 = sp_u
         .mul_div_floor(sp_u, q64_u)
         .ok_or(error!(ErrorCode::InvalidParams))?;
     
-    // 折扣 = (1 - fee_ppm/1e6) * (1 - slip_bps/1e4)
+    // Discount = (1 - fee_ppm/1e6) * (1 - slip_bps/1e4)
     let total_fee_ppm_u = U256::from(trade_fee_ppm) + U256::from(protocol_fee_ppm);
     let one_fee = U256::from(FEE_RATE_DENOMINATOR_VALUE); // 1_000_000
     let fee_factor_num = one_fee
@@ -828,7 +830,7 @@ fn execute_swap_logic(
     
     let amount_in_u = U256::from(params.amount_in);
     
-    // 先按价格得到理论输出
+    // First compute theoretical output by price
     let theoretical_out = if base_input_flag {
         amount_in_u
             .mul_div_floor(price_q64, q64_u)
@@ -839,7 +841,7 @@ fn execute_swap_logic(
             .ok_or(error!(ErrorCode::InvalidParams))?
     };
     
-    // 先按费率（/1e6）折扣，再按滑点（/1e4）折扣，避免单位混用
+    // Apply fee discount (/1e6) then slippage discount (/1e4) to avoid unit mix-ups
     let after_fee = theoretical_out
         .mul_div_floor(fee_factor_num, one_fee)
         .ok_or(error!(ErrorCode::InvalidParams))?;
@@ -883,7 +885,7 @@ fn execute_swap_logic(
     };
     let swap_amount = swap_amount_u.to_underflow_u64();
     
-    // 执行实际的 swap
+    // Execute the actual swap
     execute_actual_swap(
         ctx,
         transfer_id,
@@ -895,7 +897,7 @@ fn execute_swap_logic(
     Ok(())
 }
 
-/// 执行实际的 swap 调用
+/// Execute the actual swap CPI
 fn execute_actual_swap(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
@@ -910,7 +912,7 @@ fn execute_actual_swap(
         &[ctx.bumps.operation_data]
     ]];
 
-    // 组装输入/输出侧
+    // Assemble input/output sides
     let (in_acc, out_acc, in_vault, out_vault, in_mint, out_mint) = if base_input_flag {
         (
             ctx.accounts.pda_token0.to_account_info(),
@@ -934,14 +936,14 @@ fn execute_actual_swap(
     msg!("raydium swap amount: {}", swap_amount);
     msg!("DEBUG: About to call do_swap_single_v2");
     
-    // 准备 signer_seeds
+    // Prepare signer_seeds
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
         transfer_id.as_ref(),
         &[ctx.bumps.operation_data]
     ]];
     
-    // 执行 Raydium swap
+    // Execute Raydium swap
     do_swap_single_v2(
         ctx.accounts.clmm_program.to_account_info(),
         ctx.accounts.token_program.to_account_info(),

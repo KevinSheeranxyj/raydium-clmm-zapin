@@ -42,7 +42,7 @@ pub fn handler(mut ctx: Context<crate::Execute>, transfer_id: [u8; 32]) -> Resul
     msg!("DEBUG: Execute handler started");
     msg!("DEBUG: transfer_id: {:?}", transfer_id);
     
-    // 执行完整的流程
+    // Execute the complete flow
     execute_complete_flow(&mut ctx, transfer_id)?;
     
     msg!("DEBUG: Execute instruction completed successfully");

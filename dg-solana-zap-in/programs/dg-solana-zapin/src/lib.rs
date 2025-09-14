@@ -40,14 +40,14 @@ use crate::errors::ErrorCode;
 
 
 use crate::helpers::{to_hex32, deserialize_params, tick_array_start_index};
-use crate::state::{ExecStage, OperationType, TransferParams, ZapInParams, Registry, GlobalConfig};
+use crate::state::{OperationType, TransferParams, ZapInParams, Registry, GlobalConfig, ActionData};
 use crate::events::{DepositEvent, ExecutorAssigned};
 
 // Devnet: DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH
 pub const RAYDIUM_CLMM_PROGRAM_ID: Pubkey =
     pubkey!("DRayAUgENGQBKVaX8owNhgzkEDyoHTGVEGHVJT1E9pfH"); // devnet program ID
 
-/// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robost our requirement
+/// NOTE: For ZapIn & ZapOut, we're leveraging the Raydium-Amm-v3 Protocol SDK to robustly meet our requirements
 #[program]
 pub mod dg_solana_zapin {
     use super::*;
@@ -81,7 +81,7 @@ pub mod dg_solana_zapin {
         authorized_executor: Pubkey,
     ) -> Result<()> {
         let od = &mut ctx.accounts.operation_data;
-        // 初始化（首次该 transfer_id）
+        // Initialize (first time for this transfer_id)
         if !od.initialized {
             od.authority = ctx.accounts.authority.key();
             od.initialized = true;
@@ -96,7 +96,7 @@ pub mod dg_solana_zapin {
         require!(amount > 0, ErrorCode::InvalidAmount);
         require!(!transfer_id.is_empty(), ErrorCode::InvalidTransferId);
 
-        // 资金转入（保持原逻辑）
+        // Move funds in (keep original behavior)
         let cpi_accounts = Transfer {
             from: ctx.accounts.authority_ata.to_account_info(),
             to: ctx.accounts.program_token_account.to_account_info(),
@@ -106,25 +106,33 @@ pub mod dg_solana_zapin {
         let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
         token::transfer(cpi_ctx, amount)?;
 
-        // 存基础参数
+        // Store base parameters
         od.transfer_id = transfer_id.clone();
         od.amount = amount;
         od.executed = false;
         od.ca = ca;
         od.operation_type = operation_type.clone();
-        od.action = action.clone(); // 保留原始参数
+        // Parse raw input bytes into specific enum variant
+        od.action = match operation_type {
+            OperationType::ZapIn => {
+                let p: ZapInParams = deserialize_params(&action)?;
+                ActionData::ZapIn(p)
+            }
+            OperationType::Transfer => {
+                let p: TransferParams = deserialize_params(&action)?;
+                ActionData::Transfer(p)
+            }
+        };
         od.executor = authorized_executor; // authorized executor
 
-        // 如果是 ZapIn，解析参数并派生 tick array / protocol_position 等，存起来
-        if let OperationType::ZapIn = operation_type {
-            let p: ZapInParams = deserialize_params(&od.action)?;
+        // If ZapIn, parse params and derive tick array / protocol_position etc., store them
+        if let ActionData::ZapIn(p) = od.action.clone() {
             od.tick_lower = p.tick_lower;
             od.tick_upper = p.tick_upper;
         }
 
-        // 如果是 Transfer，存 recipient
-        if let OperationType::Transfer = operation_type {
-            let p: TransferParams = deserialize_params(&od.action)?;
+        // If Transfer, store recipient
+        if let ActionData::Transfer(p) = &od.action {
             od.recipient = p.recipient;
         }
 
@@ -132,17 +140,14 @@ pub mod dg_solana_zapin {
         emit!(ExecutorAssigned { transfer_id_hex: to_hex32(&transfer_id), executor: od.executor });
         Ok(())
     }
-
-    pub fn execute(ctx: Context<Execute>, transfer_id: [u8;32]) -> Result<()> {
+    pub fn execute(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
         instructions::execute::handler(ctx, transfer_id)
     }
 
-    // Withdraw instruction
     pub fn withdraw(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
         instructions::withdraw::handler(ctx, p)
     }
 
-    // Claim instruction
     pub fn claim(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         instructions::claim::handler(ctx, p)
     }
@@ -248,7 +253,7 @@ pub struct Initialize<'info> {
     pub authority: Signer<'info>,
     /// CHECK: solver admin
     pub set_solver: UncheckedAccount<'info>, 
-    /// 全局配置 PDA
+    /// Global configuration PDA
     #[account(
         init_if_needed,
         payer = authority,
@@ -257,6 +262,7 @@ pub struct Initialize<'info> {
         bump
     )]
     pub config: Account<'info, GlobalConfig>,
+    /// CHECK: fee receiver account
     pub fee_receiver: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
 }
@@ -269,7 +275,7 @@ pub struct OperationData {
     pub transfer_id: [u8; 32],
     pub recipient: Pubkey,
     pub operation_type: OperationType,
-    pub action: Vec<u8>,      // Serialize operation-specific parameters (cap below)
+    pub action: ActionData,     // using Enum to store different operation-specific parameters
     pub amount: u64,
     pub executed: bool,
     pub ca: Pubkey,           // contract address
@@ -279,20 +285,18 @@ pub struct OperationData {
     pub tick_upper: i32,
     pub tick_array_lower: Pubkey,
     pub tick_array_upper: Pubkey,
-    // ===== 执行阶段控制 =====
-    pub stage: ExecStage,      // << 新增
-    pub base_input_flag: bool, // << 新增：是否 token0 为输入
+    pub base_input_flag: bool, // << New: whether token0 is the input
 }
 
 impl OperationData {
-    // 这里的 LEN 选择一个保守上界即可，注意要包含新增字段
+    // Choose a conservative upper bound for LEN and include newly added fields
     pub const LEN: usize =
         32  // authority
             + 1 // initialized
             + 32 // transfer_id
             + 32 // recipient
             + 1  // operation_type (enum tag)
-            + (4 + 1024) // action: 4字节长度 + 预留 1024 bytes
+            + (4 + 1024) // action: 4-byte length + reserve 1024 bytes
             + 8  // amount
             + 1  // executed
             + 32 // ca
@@ -339,7 +343,6 @@ pub struct Deposit<'info> {
     )]
     pub program_token_account: Account<'info, TokenAccount>,
 
-    // ---- 必须加：init / init_if_needed 需要 system_program；CPI 转账需要 token_program ----
     pub token_program: Program<'info, Token>,
     pub system_program: Program<'info, System>,
 }

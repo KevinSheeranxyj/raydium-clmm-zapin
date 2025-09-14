@@ -18,70 +18,75 @@ const Q64_U128: u128 = 1u128 << 64;
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
-    /// CHECK: 仅作转发给 Raydium 的 nft_owner（不要求签名）
+    /// CHECK: Forwarded to Raydium as nft_owner (no signature required)
     pub user: UncheckedAccount<'info>,
 
     /// CHECK: spl-memo
     #[account(address = spl_memo::id())]
     pub memo_program: UncheckedAccount<'info>,
 
-    // Raydium CLMM 程序
+    // Raydium CLMM program
     #[account(constraint = clmm_program.key() == crate::RAYDIUM_CLMM_PROGRAM_ID)]
     pub clmm_program: Program<'info, AmmV3>,
     pub token_program: Program<'info, Token>,
     pub token_program_2022: Program<'info, Token2022>,
     pub system_program: Program<'info, System>,
 
-    // Raydium CLMM 账户 - 使用 UncheckedAccount
+    // Raydium CLMM accounts - UncheckedAccount passthrough
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub pool_state: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub amm_config: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub observation_state: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub protocol_position: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub personal_position: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub tick_array_lower: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub tick_array_upper: UncheckedAccount<'info>,
 
-    // Token 账户
+    // Token accounts
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_vault_0: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_vault_1: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_mint_0: UncheckedAccount<'info>,
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub token_mint_1: UncheckedAccount<'info>,
 
-    // 用户 NFT 账户
+    // User NFT account
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub nft_account: UncheckedAccount<'info>,
 
-    // 用户接收账户
+    // User recipient account
     #[account(mut)]
-    /// CHECK: 仅作转发给 Raydium 的账户
+    /// CHECK: Forwarded-only account for Raydium
     pub recipient_token_account: UncheckedAccount<'info>,
 
-    /// 全局配置（用于读取 fee_receiver）
+    /// Global config (to read fee_receiver)
     #[account(seeds = [b"global_config"], bump)]
     pub config: Account<'info, GlobalConfig>,
+
+    // Explicit fee receiver ATA passed in to avoid remaining_accounts lifetimes
+    #[account(mut)]
+    /// CHECK: validated against expected ATA in handler
+    pub fee_receiver_ata: UncheckedAccount<'info>,
 }
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -96,7 +101,7 @@ pub struct WithdrawParams {
 pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let user_key = ctx.accounts.user.key();
     
-    // 解析账户数据
+    // Parse account data
     let pool_state_data = ctx.accounts.pool_state.try_borrow_data()?;
     let pool_state = PoolState::try_deserialize(&mut &pool_state_data[..])?;
     
@@ -106,13 +111,13 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
     let recipient_info = spl_token::state::Account::unpack(&recipient_data)?;
 
-    // 验证用户NFT账户
+    // Validate user's NFT account
     let nft_account_data = ctx.accounts.nft_account.try_borrow_data()?;
     let nft_account_info = spl_token::state::Account::unpack(&nft_account_data)?;
     require!(nft_account_info.owner == user_key, ErrorCode::Unauthorized);
     require!(nft_account_info.mint == personal_position.nft_mint, ErrorCode::InvalidMint);
 
-    // 验证接收账户
+    // Validate recipient account
     let want_mint = if p.want_base { 
         pool_state.token_mint_0 
     } else { 
@@ -121,7 +126,7 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     require!(recipient_info.owner == user_key, ErrorCode::Unauthorized);
     require!(recipient_info.mint == want_mint, ErrorCode::InvalidMint);
 
-    // 读取 position（用于估算最小值）
+    // Read position (to estimate minimum outputs)
     let full_liquidity: u128 = personal_position.liquidity;
     require!(full_liquidity > 0, ErrorCode::InvalidParams);
     let burn_liq: u128 = if p.liquidity_to_burn_u64 > 0 { 
@@ -138,15 +143,15 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let sb = tick_math::get_sqrt_price_at_tick(tick_upper).map_err(|_| error!(ErrorCode::InvalidParams))?;
     require!(sa < sb, ErrorCode::InvalidTickRange);
 
-    // 当前价
+    // Current price
     let sp = pool_state.sqrt_price_x64;
 
-    // 估算最小到手
+    // Estimate minimum outputs
     let (est0, est1) = amounts_from_liquidity_burn_q64(sa, sb, sp, burn_liq);
     let min0 = apply_slippage_min(est0, p.slippage_bps);
     let min1 = apply_slippage_min(est1, p.slippage_bps);
 
-    // 创建用户NFT的ATA
+    // Create user's NFT ATA
     let nft_ata = get_associated_token_address_with_program_id(
         &user_key, 
         &personal_position.nft_mint, 
@@ -154,11 +159,11 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     );
     require!(nft_ata == ctx.accounts.nft_account.key(), ErrorCode::InvalidParams);
 
-    // 赎回前余额
+    // Balances before redeem
     let pre0 = load_token_amount(&ctx.accounts.token_vault_0)?;
     let pre1 = load_token_amount(&ctx.accounts.token_vault_1)?;
 
-    // ---------- A: 赎回流动性 ----------
+    // ---------- A: Redeem liquidity ----------
     {
         let dec_accounts = cpi::accounts::DecreaseLiquidityV2 {
             nft_owner:                 ctx.accounts.user.to_account_info(),
@@ -185,13 +190,13 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
         cpi::decrease_liquidity_v2(dec_ctx, burn_liq, min0, min1)?;
     }
 
-    // 赎回后增量
+    // Increments after redeem
     let post0 = load_token_amount(&ctx.accounts.token_vault_0)?;
     let post1 = load_token_amount(&ctx.accounts.token_vault_1)?;
     let got0  = post0.checked_sub(pre0).ok_or(error!(ErrorCode::InvalidParams))?;
     let got1  = post1.checked_sub(pre1).ok_or(error!(ErrorCode::InvalidParams))?;
 
-    // ---------- B: 单边换（可选） ----------
+    // ---------- B: One-sided swap (optional) ----------
     let (mut total_out, swap_amount, is_base_input) = if p.want_base {
         (got0, got1, false)
     } else {
@@ -234,7 +239,7 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
             );
             cpi::swap_v2(swap_ctx, swap_amount, 0, 0, is_base_input)?;
         }
-        // 刷新单边后的总量
+        // Refresh total after one-sided swap
         total_out = if p.want_base {
             load_token_amount(&ctx.accounts.token_vault_0)?
                 .checked_sub(pre0).ok_or(error!(ErrorCode::InvalidParams))?
@@ -244,10 +249,10 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
         };
     }
 
-    // ---------- C: 最低到手检查 ----------
+    // ---------- C: Minimum received check ----------
     require!(total_out >= p.min_payout, ErrorCode::InvalidParams);
 
-    // 计算 fee_receiver 的 ATA，并从 remaining_accounts 中取出对应账户
+    // Compute expected fee_receiver ATA and validate the passed account
     let want_mint = if p.want_base { 
         pool_state.token_mint_0 
     } else { 
@@ -258,20 +263,15 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
         &want_mint,
         &anchor_spl::token::ID,
     );
-    let idx = ctx
-        .remaining_accounts
-        .iter()
-        .position(|ai| ai.key == &expected_fee_ata)
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    let fee_receiver_ata_ai = ctx.remaining_accounts[idx].to_account_info();
+    require!(ctx.accounts.fee_receiver_ata.key() == expected_fee_ata, ErrorCode::InvalidParams);
 
-    // 计算手续费（按万分比）与净额
+    // Compute fee (basis points) and net amount
     let fee_amount: u64 = ((total_out as u128)
         .saturating_mul(p.fee_percentage as u128)
         / 10_000u128) as u64;
     let net_amount = total_out.checked_sub(fee_amount).ok_or(error!(ErrorCode::InvalidParams))?;
 
-    // ---------- D: 转账（先 fee 后用户） ----------
+    // ---------- D: Transfers (fee first, then user) ----------
     let from_vault = if p.want_base { 
         &ctx.accounts.token_vault_0 
     } else { 
@@ -281,7 +281,7 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     if fee_amount > 0 {
         let fee_transfer = Transfer {
             from:      from_vault.to_account_info(),
-            to:        fee_receiver_ata_ai,
+            to:        ctx.accounts.fee_receiver_ata.to_account_info(),
             authority: ctx.accounts.user.to_account_info(),
         };
         token::transfer(
