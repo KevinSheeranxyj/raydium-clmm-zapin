@@ -125,6 +125,51 @@ pub fn do_open_position_v2<'a>(
 }
 
 #[inline(never)]
+pub fn do_decrease_liquidity_v2<'a>(
+    clmm_prog_ai: AccountInfo<'a>,
+    nft_owner: AccountInfo<'a>,
+    nft_account: AccountInfo<'a>,
+    pool_state: AccountInfo<'a>,
+    protocol_position: AccountInfo<'a>,
+    personal_position: AccountInfo<'a>,
+    tick_array_lower: AccountInfo<'a>,
+    tick_array_upper: AccountInfo<'a>,
+    recipient_token_account_0: AccountInfo<'a>,
+    recipient_token_account_1: AccountInfo<'a>,
+    token_vault_0: AccountInfo<'a>,
+    token_vault_1: AccountInfo<'a>,
+    token_program: AccountInfo<'a>,
+    token_program_2022: AccountInfo<'a>,
+    vault_0_mint: AccountInfo<'a>,
+    vault_1_mint: AccountInfo<'a>,
+    memo_program: AccountInfo<'a>,
+    liquidity: u128,
+    amount_0_min: u64,
+    amount_1_min: u64,
+) -> Result<()> {
+    let accts = raydium_amm_v3::cpi::accounts::DecreaseLiquidityV2 {
+        nft_owner,
+        nft_account,
+        pool_state,
+        protocol_position,
+        personal_position,
+        tick_array_lower,
+        tick_array_upper,
+        recipient_token_account_0,
+        recipient_token_account_1,
+        token_vault_0,
+        token_vault_1,
+        token_program,
+        token_program_2022,
+        vault_0_mint,
+        vault_1_mint,
+        memo_program,
+    };
+    let ctx = CpiContext::new(clmm_prog_ai, accts);
+    raydium_amm_v3::cpi::decrease_liquidity_v2(ctx, liquidity, amount_0_min, amount_1_min)
+}
+
+#[inline(never)]
 pub fn do_increase_liquidity_v2<'a>(
     clmm_prog_ai: AccountInfo<'a>,
     user_ai: AccountInfo<'a>,
@@ -446,44 +491,6 @@ pub fn finalize_execute(
     Ok(())
 }
 
-/// Helper function to deserialize TransferParams from Anchor format
-pub fn deserialize_transfer_params_anchor(data: &[u8]) -> anchor_lang::Result<crate::state::TransferParams> {
-    msg!("DEBUG: deserialize_transfer_params_anchor called with data len: {}", data.len());
-    
-    if data.is_empty() {
-        msg!("DEBUG: TransferParams data is empty");
-        return Err(error!(ErrorCode::InvalidParams));
-    }
-    
-    msg!("DEBUG: TransferParams Anchor data - first 32 bytes: {:?}", &data[..data.len().min(32)]);
-    
-    // Find the end of the actual data (trim trailing zero bytes after the last non-zero)
-    let mut actual_len = data.len();
-    for (i, &byte) in data.iter().enumerate().rev() {
-        if byte != 0 {
-            actual_len = i + 1;
-            break;
-        }
-    }
-    
-    msg!("DEBUG: TransferParams Anchor actual data len: {}", actual_len);
-    
-    // Only deserialize the actually used data segment
-    let actual_data = &data[..actual_len];
-    
-    // Deserialize using Anchor
-    match crate::state::TransferParams::try_from_slice(actual_data) {
-        Ok(params) => {
-            msg!("DEBUG: TransferParams Anchor deserialized successfully");
-            Ok(params)
-        }
-        Err(e) => {
-            msg!("DEBUG: TransferParams Anchor deserialization failed: {:?}", e);
-            Err(error!(ErrorCode::InvalidParams))
-        }
-    }
-}
-
 /// Validate operation state
 #[inline(never)]
 pub fn validate_operation_state(
@@ -509,78 +516,45 @@ pub fn validate_operation_state(
     Ok(())
 }
 
-
-/// Execute complete ZapIn flow
-#[inline(never)]
-pub fn execute_zap_in_flow(
-    ctx: &mut Context<Execute>,
-    transfer_id: [u8; 32],
-    p: &ZapInParams,
-    transfer_amount: u64,
-) -> Result<()> {
-    // Validate account addresses and execute swap
-    let is_base_input = validate_and_execute_swap(ctx, p)?;
-    
-    // Execute swap operation
-    execute_swap_operation_wrapper(ctx, transfer_id, p, is_base_input, transfer_amount)?;
-    
-    // Create liquidity position
-    execute_open_position_with_loading(ctx, transfer_id, p)?;
-    
-    // Increase liquidity
-    execute_increase_liquidity(ctx, transfer_id, p, is_base_input)?;
-    
-    // Finalize execution
-    finalize_execute(ctx, transfer_id)?;
-    
-    Ok(())
-}
-
-/// Execute complete execute flow
-#[inline(never)]
-pub fn execute_complete_flow(
-    ctx: &mut Context<Execute>,
-    transfer_id: [u8; 32],
-) -> Result<()> {
-    let caller_key = ctx.accounts.caller.key();
-    msg!("DEBUG: caller_key: {}", caller_key);
-    
-    // 1) Validate state
-    validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
-    
-    // 2) Execute flow based on operation type
-    let amount = ctx.accounts.operation_data.amount;
-    // Extract params from enum
-    let params = match &ctx.accounts.operation_data.action {
-        ActionData::ZapIn(p) => p.clone(),
-        _ => return Err(error!(ErrorCode::InvalidParams)),
-    };
-    execute_zap_in_flow(ctx, transfer_id, &params, amount)?;
-    
-    Ok(())
-}
-
 /// Validate account addresses
 #[inline(never)]
 pub fn validate_accounts_only(
     ctx: &Context<Execute>,
-) -> Result<()> {
-    validate_account_addresses_unchecked(
-        &ctx.accounts.amm_config.to_account_info(),
-        &ctx.accounts.observation_state.to_account_info(),
-        &ctx.accounts.token_mint_0.to_account_info(),
-        &ctx.accounts.token_mint_1.to_account_info(),
-        &ctx.accounts.token_vault_0.to_account_info(),
-        &ctx.accounts.token_vault_1.to_account_info(),
-        &ctx.accounts.pool_state,
-    )
+) -> Result<bool> {
+    msg!("DEBUG: About to validate account addresses and determine base input");
+    // Parse PoolState once and extract only the keys we need, then drop PoolState
+    let (amm_cfg_key, obs_key, mint0_key, mint1_key, vault0_key, vault1_key) = {
+        let ps = parse_pool_state(&ctx.accounts.pool_state)?;
+        (
+            ps.amm_config,
+            ps.observation_key,
+            ps.token_mint_0,
+            ps.token_mint_1,
+            ps.token_vault_0,
+            ps.token_vault_1,
+        )
+    }; // ps dropped here
+
+    // Validate individual account addresses
+    validate_single_account(&ctx.accounts.amm_config.to_account_info().key, &amm_cfg_key, "amm_config")?;
+    validate_single_account(&ctx.accounts.observation_state.to_account_info().key, &obs_key, "observation_state")?;
+    validate_single_account(&ctx.accounts.token_mint_0.to_account_info().key, &mint0_key, "token_mint_0")?;
+    validate_single_account(&ctx.accounts.token_mint_1.to_account_info().key, &mint1_key, "token_mint_1")?;
+    validate_single_account(&ctx.accounts.token_vault_0.to_account_info().key, &vault0_key, "token_vault_0")?;
+    validate_single_account(&ctx.accounts.token_vault_1.to_account_info().key, &vault1_key, "token_vault_1")?;
+
+    // Determine which side is the input token
+    let is_base_input = mint0_key == *ctx.accounts.token_mint_0.to_account_info().key;
+    msg!("DEBUG: determine base_input = {}", is_base_input);
+    Ok(is_base_input)
 }
 
 /// Get is_base_input flag
-#[inline]
+#[inline(never)]
 pub fn get_is_base_input(
     ctx: &Context<Execute>,
 ) -> Result<bool> {
+    // Fallback implementation that deserializes PoolState (kept for compatibility)
     let pool_state = parse_pool_state(&ctx.accounts.pool_state)?;
     let is_base_input = pool_state.token_mint_0 == ctx.accounts.token_mint_0.key();
     msg!("pool_state.token_mint_0: {}, account.token_mint_0: {}", pool_state.token_mint_0, ctx.accounts.token_mint_0.key());
@@ -593,11 +567,8 @@ pub fn validate_and_execute_swap(
     ctx: &Context<Execute>,
     _p: &ZapInParams,
 ) -> Result<bool> {
-    // Validate account addresses
-    validate_accounts_only(ctx)?;
-    
-    // Obtain is_base_input flag
-    get_is_base_input(ctx)
+    // Validate account addresses and determine input side in a single pass
+    validate_accounts_only(ctx)
 }
 
 /// Execute swap operation
@@ -609,15 +580,12 @@ pub fn execute_swap_operation_wrapper(
     is_base_input: bool,
     transfer_amount: u64,
 ) -> Result<()> {
-    let pool_state = parse_pool_state(&ctx.accounts.pool_state)?;
-    let pool_state_data = pool_state.clone();
-    
-    // Execute swap operation
+    // Avoid deserializing PoolState here to reduce stack usage. Swap logic will
+    // derive needed values from token vault balances and provided params.
     execute_swap_operation(
         ctx,
         transfer_id,
         p,
-        &pool_state_data,
         is_base_input,
         transfer_amount,
     )?;
@@ -632,20 +600,22 @@ pub fn execute_open_position_with_loading(
     p: &ZapInParams,
 ) -> Result<()> {
     let pool_state = parse_pool_state(&ctx.accounts.pool_state)?;
-    execute_open_position(ctx, transfer_id, p, &pool_state)
+    execute_open_position(ctx, transfer_id, p, &*pool_state)
 }
 
 /// Parse PoolState data
 #[inline]
-pub fn parse_pool_state(pool_state: &UncheckedAccount) -> Result<PoolState> {
+pub fn parse_pool_state(pool_state: &UncheckedAccount) -> Result<Box<PoolState>> {
     let pool_state_data = pool_state.try_borrow_data()?;
-    PoolState::try_deserialize(&mut &pool_state_data[..])
+    let ps: PoolState = PoolState::try_deserialize(&mut &pool_state_data[..])?;
+    Ok(Box::new(ps))
 }
 
 #[inline]
-pub fn parse_amm_config(amm_config: &UncheckedAccount) -> Result<AmmConfig> {
+pub fn parse_amm_config(amm_config: &UncheckedAccount) -> Result<Box<AmmConfig>> {
     let data = amm_config.try_borrow_data()?;
-    AmmConfig::try_deserialize(&mut &data[..])
+    let cfg: AmmConfig = AmmConfig::try_deserialize(&mut &data[..])?;
+    Ok(Box::new(cfg))
 }
 
 /// Validate a single account address
@@ -673,54 +643,25 @@ pub fn validate_account_addresses_unchecked(
     pool_state: &UncheckedAccount,
 ) -> Result<()> {
     msg!("DEBUG: About to validate account addresses with UncheckedAccount");
-    
-    // Manually parse PoolState data
-    let pool_state = parse_pool_state(pool_state)?;
-    
+    // Parse PoolState and copy only the needed keys into locals, then drop PoolState to reduce frame size
+    let (amm_cfg_key, obs_key, mint0_key, mint1_key, vault0_key, vault1_key) = {
+        let ps = parse_pool_state(pool_state)?;
+        (
+            ps.amm_config,
+            ps.observation_key,
+            ps.token_mint_0,
+            ps.token_mint_1,
+            ps.token_vault_0,
+            ps.token_vault_1,
+        )
+    };
     // Validate individual account addresses
-    validate_single_account(&amm_config.key, &pool_state.amm_config, "amm_config")?;
-    validate_single_account(&observation_state.key, &pool_state.observation_key, "observation_state")?;
-    validate_single_account(&token_mint_0.key, &pool_state.token_mint_0, "token_mint_0")?;
-    validate_single_account(&token_mint_1.key, &pool_state.token_mint_1, "token_mint_1")?;
-    validate_single_account(&token_vault_0.key, &pool_state.token_vault_0, "token_vault_0")?;
-    validate_single_account(&token_vault_1.key, &pool_state.token_vault_1, "token_vault_1")?;
-    
-    Ok(())
-}
-
-pub fn validate_account_addresses(
-    amm_config: &AccountInfo,
-    observation_state: &AccountInfo,
-    token_mint_0: &AccountInfo,
-    token_mint_1: &AccountInfo,
-    token_vault_0: &AccountInfo,
-    token_vault_1: &AccountInfo,
-    pool_state: &PoolState,
-) -> Result<()> {
-    msg!("DEBUG: About to validate account addresses");
-    msg!("DEBUG: amm_config key: {}, pool_state.amm_config: {}", amm_config.key, pool_state.amm_config);
-    require!(*amm_config.key == pool_state.amm_config, ErrorCode::InvalidParams);
-    msg!("DEBUG: amm_config validation passed");
-    
-    msg!("DEBUG: observation_state key: {}, pool_state.observation_key: {}", observation_state.key, pool_state.observation_key);
-    require!(*observation_state.key == pool_state.observation_key, ErrorCode::InvalidParams);
-    msg!("DEBUG: observation_state validation passed");
-    
-    msg!("DEBUG: token_mint_0 key: {}, pool_state.token_mint_0: {}", token_mint_0.key, pool_state.token_mint_0);
-    require!(*token_mint_0.key == pool_state.token_mint_0, ErrorCode::InvalidParams);
-    msg!("DEBUG: token_mint_0 validation passed");
-    
-    msg!("DEBUG: token_mint_1 key: {}, pool_state.token_mint_1: {}", token_mint_1.key, pool_state.token_mint_1);
-    require!(*token_mint_1.key == pool_state.token_mint_1, ErrorCode::InvalidParams);
-    msg!("DEBUG: token_mint_1 validation passed");
-    
-    msg!("DEBUG: token_vault_0 key: {}, pool_state.token_vault_0: {}", token_vault_0.key, pool_state.token_vault_0);
-    require!(*token_vault_0.key == pool_state.token_vault_0, ErrorCode::InvalidParams);
-    msg!("DEBUG: token_vault_0 validation passed");
-    
-    msg!("DEBUG: token_vault_1 key: {}, pool_state.token_vault_1: {}", token_vault_1.key, pool_state.token_vault_1);
-    require!(*token_vault_1.key == pool_state.token_vault_1, ErrorCode::InvalidParams);
-    msg!("DEBUG: token_vault_1 validation passed");
+    validate_single_account(&amm_config.key, &amm_cfg_key, "amm_config")?;
+    validate_single_account(&observation_state.key, &obs_key, "observation_state")?;
+    validate_single_account(&token_mint_0.key, &mint0_key, "token_mint_0")?;
+    validate_single_account(&token_mint_1.key, &mint1_key, "token_mint_1")?;
+    validate_single_account(&token_vault_0.key, &vault0_key, "token_vault_0")?;
+    validate_single_account(&token_vault_1.key, &vault1_key, "token_vault_1")?;
     
     Ok(())
 }
@@ -730,37 +671,18 @@ pub fn execute_swap_operation(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
     params: &ZapInParams,
-    pool_state: &PoolState,
     base_input_flag: bool,
     transfer_amount: u64,
 ) -> Result<()> {
-    msg!("DEBUG: About to start swap operation");
-    
-    // Compute tick array start indices
-    let lower_start = tick_array_start_index(params.tick_lower, pool_state.tick_spacing as i32);
-    let upper_start = tick_array_start_index(params.tick_upper, pool_state.tick_spacing as i32);
-    
-    // Compute tick array PDA addresses
-    let pool_state_key = ctx.accounts.pool_state.key();
-    let tick_array_lower_pda = Pubkey::find_program_address(
-        &[
-            b"tick_array",
-            pool_state_key.as_ref(),
-            &lower_start.to_le_bytes(),
-        ],
-        &ctx.accounts.clmm_program.key,
-    ).0;
-    
-    let tick_array_upper_pda = Pubkey::find_program_address(
-        &[
-            b"tick_array",
-            pool_state_key.as_ref(),
-            &upper_start.to_le_bytes(),
-        ],
-        &ctx.accounts.clmm_program.key,
-    ).0;
+    msg!("DEBUG: About to start swap operation (no pool_state/amm_config deserialization)");
     
     // Transfer funds to PDA account
+    let program_balance = load_token_amount(&ctx.accounts.program_token_account.to_account_info())?;
+    msg!("DEBUG: program_token_account balance: {}", program_balance);
+    msg!("DEBUG: transfer_amount requested: {}", transfer_amount);
+    require!(program_balance >= transfer_amount, ErrorCode::InvalidAmount);
+
+    // Transfer from program_token_account -> pda_token0 (same as before)
     let cpi_accounts = Transfer {
         from: ctx.accounts.program_token_account.to_account_info(),
         to: ctx.accounts.pda_token0.to_account_info(),
@@ -773,64 +695,51 @@ pub fn execute_swap_operation(
         &[ctx.bumps.operation_data]
     ]];
     let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
+    msg!("DEBUG: About to invoke token::transfer CPI");
     token::transfer(cpi_ctx, transfer_amount)?;
-    
-    // Perform swap logic
-    execute_swap_logic(
+    msg!("DEBUG: token::transfer CPI succeeded");
+
+    // Execute swap logic without deserializing pool_state/amm_config. We'll
+    // approximate price from vault balances and use slippage to compute min_out.
+    execute_swap_logic_no_deser(
         ctx,
         transfer_id,
         params,
-        pool_state,
         base_input_flag,
-        &tick_array_lower_pda,
-        &tick_array_upper_pda,
     )?;
-    
+
     Ok(())
 }
 
-/// Core part of executing swap logic
-fn execute_swap_logic(
+// New: swap logic that avoids deserializing PoolState/AmmConfig
+fn execute_swap_logic_no_deser(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
     params: &ZapInParams,
-    pool_state: &PoolState,
     base_input_flag: bool,
-    tick_array_lower_pda: &Pubkey,
-    tick_array_upper_pda: &Pubkey,
 ) -> Result<()> {
-    // Balance token ratios (swap_for_balance logic)
-    let sp = pool_state.sqrt_price_x64;
-    // Parse AmmConfig data
-    let amm_cfg = parse_amm_config(&ctx.accounts.amm_config)?;
-    
-    // Fee rates are in ppm (1e6)
-    let trade_fee_ppm: u32 = amm_cfg.trade_fee_rate.into();
-    let protocol_fee_ppm: u32 = amm_cfg.protocol_fee_rate.into();
-    
-    // Compute min_out
-    let sp_u = U256::from(sp);
+    msg!("DEBUG: execute_swap_logic_no_deser start");
+
+    // Read vault balances to infer price: price ~ vault_out / vault_in
+    let vault0_bal = load_token_amount(&ctx.accounts.token_vault_0.to_account_info())? as u128;
+    let vault1_bal = load_token_amount(&ctx.accounts.token_vault_1.to_account_info())? as u128;
+    msg!("DEBUG: token_vault_0 balance: {}", vault0_bal);
+    msg!("DEBUG: token_vault_1 balance: {}", vault1_bal);
+
+    // Prevent division by zero
+    require!(vault0_bal > 0 && vault1_bal > 0, ErrorCode::InvalidParams);
+
+    // Compute a Q64.64-ish price approximation as u128 (price_q64 ~ (vault1/vault0) * 2^64)
+    // price_q64 = (vault1_bal << 64) / vault0_bal
+    let price_q64_u128 = ((vault1_bal as u128) << 64) / (vault0_bal as u128);
+    let price_q64 = U256::from(price_q64_u128);
+    // Q64 factor as U256 for fixed-point arithmetic
     let q64_u = U256::from(Q64_U128);
-    let price_q64 = sp_u
-        .mul_div_floor(sp_u, q64_u)
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    
-    // Discount = (1 - fee_ppm/1e6) * (1 - slip_bps/1e4)
-    let total_fee_ppm_u = U256::from(trade_fee_ppm) + U256::from(protocol_fee_ppm);
-    let one_fee = U256::from(FEE_RATE_DENOMINATOR_VALUE); // 1_000_000
-    let fee_factor_num = one_fee
-        .checked_sub(total_fee_ppm_u)
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    
-    let slip_bps = params.slippage_bps.min(10_000);
-    let one_slip = U256::from(10_000u32); // 1e4
-    let slip_factor_num = one_slip
-        .checked_sub(U256::from(slip_bps))
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    
+    // Approximate current sqrt_price_x64 as u128 for subsequent tick math comparisons
+    let sp_q64_approx: u128 = price_q64_u128;
+
+    // Theoretical out using approximated price
     let amount_in_u = U256::from(params.amount_in);
-    
-    // First compute theoretical output by price
     let theoretical_out = if base_input_flag {
         amount_in_u
             .mul_div_floor(price_q64, q64_u)
@@ -840,40 +749,53 @@ fn execute_swap_logic(
             .mul_div_floor(q64_u, price_q64.max(U256::from(1u8)))
             .ok_or(error!(ErrorCode::InvalidParams))?
     };
-    
-    // Apply fee discount (/1e6) then slippage discount (/1e4) to avoid unit mix-ups
-    let after_fee = theoretical_out
-        .mul_div_floor(fee_factor_num, one_fee)
+
+    // Apply slippage only (we don't have fees without parsing AmmConfig). This is
+    // conservative: require user to provide enough slippage to accommodate fees.
+    let slip_bps = params.slippage_bps.min(10_000);
+    let one_slip = U256::from(10_000u32); // 1e4
+    let slip_factor_num = one_slip
+        .checked_sub(U256::from(slip_bps))
         .ok_or(error!(ErrorCode::InvalidParams))?;
-    let min_out_u = after_fee
+    let min_out_u = theoretical_out
         .mul_div_floor(slip_factor_num, one_slip)
         .ok_or(error!(ErrorCode::InvalidParams))?;
     let min_amount_out = min_out_u.to_underflow_u64();
-    
-    // 计算一次 swap 的分摊
+    msg!("DEBUG: approximated min_amount_out: {}", min_amount_out);
+    msg!("DEBUG: tick_lower: {}, tick_upper: {}", params.tick_lower, params.tick_upper);
+    // Compute swap_amount portion using ticks from params only (same as before)
     let sa = tick_math::get_sqrt_price_at_tick(params.tick_lower).map_err(|_| error!(ErrorCode::InvalidParams))?;
     let sb = tick_math::get_sqrt_price_at_tick(params.tick_upper).map_err(|_| error!(ErrorCode::InvalidParams))?;
-    let sa_u = U256::from(sa);
-    let sb_u = U256::from(sb);
-    let sp_u2 = U256::from(sp);
-    require!(sa < sb, ErrorCode::InvalidTickRange);
-    msg!("sa: {}, sb: {}, sp: {}", sa_u, sb_u, sp_u2);
-    let sp_minus_sa = if sp_u2 >= sa_u { sp_u2 - sa_u } else { return err!(ErrorCode::InvalidParams); };
-    msg!("sp_minus_sa: {}", sp_minus_sa);
-    let sb_minus_sp = if sb_u >= sp_u2 { sb_u - sp_u2 } else { return err!(ErrorCode::InvalidParams); };
-    msg!("sb_minus_sp: {}", sb_minus_sp);
-    
-    // 直接用 mul_div_floor，确保不溢出
-    let r_num = sb_u
-        .mul_div_floor(sp_minus_sa, U256::from(1u8))
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    let r_den = sp_u2
-        .mul_div_floor(sb_minus_sp, U256::from(1u8))
-        .ok_or(error!(ErrorCode::InvalidParams))?;
-    
+    msg!("DEBUG: sa (Q64.64): {}", sa);
+    msg!("DEBUG: sb (Q64.64): {}", sb);
+    msg!("DEBUG: sp_q64_approx (Q64.64 approx): {}", sp_q64_approx);
+    // If provided ticks don't contain current price, fail (automatic derivation disabled to avoid stack/AV)
+    // compare using u128 values (sa/sb/sp_q64_approx are u128)
+    if !(sa < sp_q64_approx && sp_q64_approx < sb) {
+        msg!("DEBUG: provided tick bounds do not contain current price; automatic derivation disabled to avoid stack/write issues");
+        return err!(ErrorCode::InvalidParams);
+    }
+
+    // existing r_num/r_den computation continues here when original sa/sb valid
+    let (r_num, r_den) = {
+        let sa_u = U256::from(sa);
+        let sb_u = U256::from(sb);
+        let sp_u = U256::from(sp_q64_approx);
+
+        let sp_minus_sa = if sp_u >= sa_u { sp_u - sa_u } else { return err!(ErrorCode::InvalidParams); };
+        let sb_minus_sp = if sb_u >= sp_u { sb_u - sp_u } else { return err!(ErrorCode::InvalidParams); };
+
+        let r_num_local = sb_u
+            .mul_div_floor(sp_minus_sa, U256::from(1u8))
+            .ok_or(error!(ErrorCode::InvalidParams))?;
+        let r_den_local = sp_u
+            .mul_div_floor(sb_minus_sp, U256::from(1u8))
+            .ok_or(error!(ErrorCode::InvalidParams))?;
+        (r_num_local, r_den_local)
+    };
+
     let frac_den = r_den.checked_add(r_num).ok_or(error!(ErrorCode::InvalidParams))?;
     require!(frac_den > U256::from(0u8), ErrorCode::InvalidParams);
-    msg!("frac_den: {}, r_den: {}, r_num: {}", frac_den, r_den, r_num);
     let swap_amount_u = if base_input_flag {
         U256::from(params.amount_in)
             .mul_div_floor(r_num, frac_den)
@@ -884,8 +806,9 @@ fn execute_swap_logic(
             .ok_or(error!(ErrorCode::InvalidParams))?
     };
     let swap_amount = swap_amount_u.to_underflow_u64();
-    
-    // Execute the actual swap
+    msg!("DEBUG: computed swap_amount: {}", swap_amount);
+
+    // Execute the actual swap CPI
     execute_actual_swap(
         ctx,
         transfer_id,
@@ -893,7 +816,8 @@ fn execute_swap_logic(
         swap_amount,
         min_amount_out,
     )?;
-    
+
+    msg!("DEBUG: execute_swap_logic_no_deser completed successfully");
     Ok(())
 }
 
@@ -968,4 +892,3 @@ fn execute_actual_swap(
     msg!("DEBUG: do_swap_single_v2 completed successfully");
     Ok(())
 }
-

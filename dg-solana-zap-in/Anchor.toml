@@ -6,10 +6,10 @@ resolution = true
 skip-lint = false
 
 [programs.devnet]
-dg_solana_zapin = "DisiSrRg8fWzsy8UXAGwh8VobnCTTg1uiC6iKSNaBrYL"
+dg_solana_zapin = "2h2KDqUHkHf7DVUd3SJCeEPPLMLiYuviojp3YFJgMnZN"
 
 [programs.mainnet]
-dg_solana_zapin = "DisiSrRg8fWzsy8UXAGwh8VobnCTTg1uiC6iKSNaBrYL"
+dg_solana_zapin = "2h2KDqUHkHf7DVUd3SJCeEPPLMLiYuviojp3YFJgMnZN"
 
 [registry]
 url = "https://api.apr.dev"

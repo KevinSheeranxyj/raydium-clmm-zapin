@@ -105,12 +105,17 @@ pub struct ClaimParams {
 pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     let user_key = ctx.accounts.user.key();
     
-    // Parse account data
-    let pool_state_data = ctx.accounts.pool_state.try_borrow_data()?;
-    let pool_state = PoolState::try_deserialize(&mut &pool_state_data[..])?;
-    
-    let personal_position_data = ctx.accounts.personal_position.try_borrow_data()?;
-    let personal_position = PersonalPositionState::try_deserialize(&mut &personal_position_data[..])?;
+    // Parse account data with minimal lifetimes; copy out only required fields
+    let (pool_token_mint_0, pool_token_mint_1) = {
+        let data = ctx.accounts.pool_state.try_borrow_data()?;
+        let ps = PoolState::try_deserialize(&mut &data[..])?;
+        (ps.token_mint_0, ps.token_mint_1)
+    };
+    let (pos_nft_mint) = {
+        let data = ctx.accounts.personal_position.try_borrow_data()?;
+        let pp = PersonalPositionState::try_deserialize(&mut &data[..])?;
+        (pp.nft_mint)
+    };
     
     let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
     let recipient_info = spl_token::state::Account::unpack(&recipient_data)?;
@@ -119,39 +124,39 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     let nft_account_data = ctx.accounts.nft_account.try_borrow_data()?;
     let nft_account_info = spl_token::state::Account::unpack(&nft_account_data)?;
     require!(nft_account_info.owner == user_key, ErrorCode::Unauthorized);
-    require!(nft_account_info.mint == personal_position.nft_mint, ErrorCode::InvalidMint);
+    require!(nft_account_info.mint == pos_nft_mint, ErrorCode::InvalidMint);
 
     // Validate recipient account
     require!(recipient_info.owner == user_key, ErrorCode::Unauthorized);
-    require!(recipient_info.mint == pool_state.token_mint_0 || recipient_info.mint == pool_state.token_mint_1, ErrorCode::InvalidMint);
+    require!(recipient_info.mint == pool_token_mint_0 || recipient_info.mint == pool_token_mint_1, ErrorCode::InvalidMint);
 
     let usdc_mint = recipient_info.mint;
 
     // Create PDA to receive tokens
     let (pda, _bump) = Pubkey::find_program_address(
-        &[b"claim_pda", user_key.as_ref(), &personal_position.nft_mint.to_bytes()],
+        &[b"claim_pda", user_key.as_ref(), &pos_nft_mint.to_bytes()],
         &crate::ID,
     );
 
     // Create PDA's token accounts
     let _pda_token_account_0 = get_associated_token_address_with_program_id(
         &pda,
-        &pool_state.token_mint_0,
+        &pool_token_mint_0,
         &anchor_spl::token::ID,
     );
     let _pda_token_account_1 = get_associated_token_address_with_program_id(
         &pda,
-        &pool_state.token_mint_1,
+        &pool_token_mint_1,
         &anchor_spl::token::ID,
     );
 
     // Record balances before claim (on both PDA vaults)
     let pre0 = load_token_amount(&ctx.accounts.token_vault_0)?;
     let pre1 = load_token_amount(&ctx.accounts.token_vault_1)?;
-    let pre_usdc = if usdc_mint == pool_state.token_mint_0 { pre0 } else { pre1 };
+    let pre_usdc = if usdc_mint == pool_token_mint_0 { pre0 } else { pre1 };
 
     // seeds
-    let signer_seeds_slice: [&[u8]; 3] = [b"claim_pda".as_ref(), user_key.as_ref(), &personal_position.nft_mint.to_bytes()];
+    let signer_seeds_slice: [&[u8]; 3] = [b"claim_pda".as_ref(), user_key.as_ref(), &pos_nft_mint.to_bytes()];
     let _signer_seeds: &[&[&[u8]]] = &[&signer_seeds_slice];
 
     // 1) Settle fees only (liquidity=0)
@@ -192,10 +197,10 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     }
 
     // 2) Swap the non-USDC side fully into USDC
-    let mut total_usdc_after_swap = if usdc_mint == pool_state.token_mint_0 { pre_usdc + got0 } else { pre_usdc + got1 };
-    if (usdc_mint == pool_state.token_mint_0 && got1 > 0) || (usdc_mint == pool_state.token_mint_1 && got0 > 0) {
+    let mut total_usdc_after_swap = if usdc_mint == pool_token_mint_0 { pre_usdc + got0 } else { pre_usdc + got1 };
+    if (usdc_mint == pool_token_mint_0 && got1 > 0) || (usdc_mint == pool_token_mint_1 && got0 > 0) {
         let (in_vault, out_vault, in_mint, out_mint, is_base_input, amount_in) =
-            if usdc_mint == pool_state.token_mint_0 {
+            if usdc_mint == pool_token_mint_0 {
                 (ctx.accounts.token_vault_1.to_account_info(), 
                  ctx.accounts.token_vault_0.to_account_info(),
                  ctx.accounts.token_mint_1.to_account_info(), 
@@ -231,7 +236,7 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
         cpi::swap_v2(swap_ctx, amount_in, 0, 0, is_base_input)?;
 
         // Refresh USDC balance
-        total_usdc_after_swap = if usdc_mint == pool_state.token_mint_0 {
+        total_usdc_after_swap = if usdc_mint == pool_token_mint_0 {
             load_token_amount(&ctx.accounts.token_vault_0)?
         } else {
             load_token_amount(&ctx.accounts.token_vault_1)?
@@ -256,7 +261,7 @@ pub fn handler(ctx: Context<Claim>, p: ClaimParams) -> Result<()> {
     let net_amount = total_usdc_after_swap.checked_sub(fee_amount).ok_or(error!(ErrorCode::InvalidParams))?;
 
     // Transfer from PDA vault: fee first, then user
-    let transfer_from = if usdc_mint == pool_state.token_mint_0 {
+    let transfer_from = if usdc_mint == pool_token_mint_0 {
         &ctx.accounts.token_vault_0
     } else {
         &ctx.accounts.token_vault_1

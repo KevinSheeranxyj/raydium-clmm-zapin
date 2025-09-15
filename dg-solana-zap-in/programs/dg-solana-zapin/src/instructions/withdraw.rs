@@ -14,7 +14,7 @@ use crate::helpers::{load_token_amount, amounts_from_liquidity_burn_q64, apply_s
 use crate::state::GlobalConfig;
 use anchor_lang::solana_program::program_pack::Pack;
 
-const Q64_U128: u128 = 1u128 << 64;
+// Removed unused Q64_U128 to reduce warnings and keep frames small
 
 #[derive(Accounts)]
 pub struct Withdraw<'info> {
@@ -112,12 +112,18 @@ pub struct WithdrawParams {
 pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let user_key = ctx.accounts.user.key();
     
-    // Parse account data
-    let pool_state_data = ctx.accounts.pool_state.try_borrow_data()?;
-    let pool_state = PoolState::try_deserialize(&mut &pool_state_data[..])?;
-    
-    let personal_position_data = ctx.accounts.personal_position.try_borrow_data()?;
-    let personal_position = PersonalPositionState::try_deserialize(&mut &personal_position_data[..])?;
+    // Parse account data in a tight scope and copy only required fields to reduce stack usage
+    let (pool_token_mint_0, pool_token_mint_1, pool_sqrt_price_x64, pool_tick_spacing) = {
+        let data = ctx.accounts.pool_state.try_borrow_data()?;
+        let ps = PoolState::try_deserialize(&mut &data[..])?;
+        (ps.token_mint_0, ps.token_mint_1, ps.sqrt_price_x64, ps.tick_spacing)
+    };
+
+    let (pos_nft_mint, pos_tick_lower, pos_tick_upper, pos_liquidity) = {
+        let data = ctx.accounts.personal_position.try_borrow_data()?;
+        let pp = PersonalPositionState::try_deserialize(&mut &data[..])?;
+        (pp.nft_mint, pp.tick_lower_index, pp.tick_upper_index, pp.liquidity)
+    };
     
     let recipient_data = ctx.accounts.recipient_token_account.try_borrow_data()?;
     let recipient_info = spl_token::state::Account::unpack(&recipient_data)?;
@@ -126,19 +132,15 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let nft_account_data = ctx.accounts.nft_account.try_borrow_data()?;
     let nft_account_info = spl_token::state::Account::unpack(&nft_account_data)?;
     require!(nft_account_info.owner == user_key, ErrorCode::Unauthorized);
-    require!(nft_account_info.mint == personal_position.nft_mint, ErrorCode::InvalidMint);
+    require!(nft_account_info.mint == pos_nft_mint, ErrorCode::InvalidMint);
 
     // Validate recipient account
-    let want_mint = if p.want_base { 
-        pool_state.token_mint_0 
-    } else { 
-        pool_state.token_mint_1 
-    };
+    let want_mint = if p.want_base { pool_token_mint_0 } else { pool_token_mint_1 };
     require!(recipient_info.owner == user_key, ErrorCode::Unauthorized);
     require!(recipient_info.mint == want_mint, ErrorCode::InvalidMint);
 
     // Read position (to estimate minimum outputs)
-    let full_liquidity: u128 = personal_position.liquidity;
+    let full_liquidity: u128 = pos_liquidity;
     require!(full_liquidity > 0, ErrorCode::InvalidParams);
     let burn_liq: u128 = if p.liquidity_to_burn_u64 > 0 { 
         p.liquidity_to_burn_u64 as u128 
@@ -147,15 +149,15 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     };
     require!(burn_liq <= full_liquidity, ErrorCode::InvalidParams);
 
-    let tick_lower = personal_position.tick_lower_index;
-    let tick_upper = personal_position.tick_upper_index;
+    let tick_lower = pos_tick_lower;
+    let tick_upper = pos_tick_upper;
 
     let sa = tick_math::get_sqrt_price_at_tick(tick_lower).map_err(|_| error!(ErrorCode::InvalidParams))?;
     let sb = tick_math::get_sqrt_price_at_tick(tick_upper).map_err(|_| error!(ErrorCode::InvalidParams))?;
     require!(sa < sb, ErrorCode::InvalidTickRange);
 
     // Current price
-    let sp = pool_state.sqrt_price_x64;
+    let sp = pool_sqrt_price_x64;
 
     // Estimate minimum outputs
     let (est0, est1) = amounts_from_liquidity_burn_q64(sa, sb, sp, burn_liq);
@@ -163,11 +165,7 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
     let min1 = apply_slippage_min(est1, p.slippage_bps);
 
     // Create user's NFT ATA
-    let nft_ata = get_associated_token_address_with_program_id(
-        &user_key, 
-        &personal_position.nft_mint, 
-        &anchor_spl::token::ID
-    );
+    let nft_ata = get_associated_token_address_with_program_id(&user_key, &pos_nft_mint, &anchor_spl::token::ID);
     require!(nft_ata == ctx.accounts.nft_account.key(), ErrorCode::InvalidParams);
 
     // Balances before redeem
@@ -265,9 +263,9 @@ pub fn handler(ctx: Context<Withdraw>, p: WithdrawParams) -> Result<()> {
 
     // Compute expected fee_receiver ATA and validate the passed account
     let want_mint = if p.want_base { 
-        pool_state.token_mint_0 
+        pool_token_mint_0 
     } else { 
-        pool_state.token_mint_1 
+        pool_token_mint_1 
     };
     let expected_fee_ata = get_associated_token_address_with_program_id(
         &ctx.accounts.config.fee_receiver,
