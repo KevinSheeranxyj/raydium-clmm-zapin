@@ -116,30 +116,6 @@ fn try_deser_anchor_account<T: AccountDeserialize>(
     })
 }
 
-/// True iff the account looks like `T` **and** is owned by `owner`.
-fn is_anchor_account_owned<T: AccountDeserialize>(
-    ai: &AccountInfo,
-    owner: &Pubkey,
-) -> bool {
-    if *ai.owner != *owner { return false; }
-    if let Ok(data) = ai.try_borrow_data() {
-        if data.len() < 8 { return false; }
-        let mut bytes: &[u8] = &data;
-        T::try_deserialize(&mut bytes).is_ok()
-    } else {
-        false
-    }
-}
-
-
-fn find_acc_idx(ras: &[AccountInfo], key: &Pubkey, label: &str) -> anchor_lang::Result<usize> {
-    ras.iter()
-        .position(|ai| *ai.key == *key)
-        .ok_or_else(|| {
-            msg!("missing account in remaining_accounts: {} = {}", label, key);
-            error!(ErrorCode::InvalidParams)
-        })
-}
 
 pub fn unpack_token_account(ai: &AccountInfo) -> Option<spl_token::state::Account> {
     // Only SPL Token or Token-2022 accounts can be unpacked
@@ -233,9 +209,11 @@ pub fn execute_increase_liquidity(
     msg!("DEBUG: pre0 = {}, pre1 = {}", pre0, pre1);
     
     // Use helper function to call Raydium increase_liquidity_v2
+    let stored_id = ctx.accounts.operation_data.transfer_id;
+    require!(stored_id == transfer_id, ErrorCode::InvalidTransferId);
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
-        transfer_id.as_ref(),
+        stored_id.as_ref(),
         &[ctx.bumps.operation_data]
     ]];
     msg!("DEBUG: About to call do_increase_liquidity_v2");
@@ -433,18 +411,27 @@ pub fn execute_swap_operation(
     msg!("DEBUG: transfer_amount requested: {}", transfer_amount);
     require!(program_balance >= transfer_amount, ErrorCode::InvalidAmount);
 
-    // Transfer from program_token_account -> pda_token0 (same as before)
+    // Build signer seeds using the stored transfer_id on the PDA; ensure it matches param
+    let stored_id = ctx.accounts.operation_data.transfer_id;
+    require!(stored_id == transfer_id, ErrorCode::InvalidTransferId);
+    let signer_seeds: &[&[&[u8]]] = &[&[
+        b"operation_data",
+        stored_id.as_ref(),
+        &[ctx.bumps.operation_data]
+    ]];
+
+    // Transfer from program_token_account -> PDA token account for the input side
+    let dest_pda_ata = if base_input_flag {
+        ctx.accounts.pda_token0.to_account_info()
+    } else {
+        ctx.accounts.pda_token1.to_account_info()
+    };
     let cpi_accounts = Transfer {
         from: ctx.accounts.program_token_account.to_account_info(),
-        to: ctx.accounts.pda_token0.to_account_info(),
+        to: dest_pda_ata,
         authority: ctx.accounts.operation_data.to_account_info(),
     };
     let cpi_program = ctx.accounts.token_program.to_account_info();
-    let signer_seeds: &[&[&[u8]]] = &[&[
-        b"operation_data",
-        transfer_id.as_ref(),
-        &[ctx.bumps.operation_data]
-    ]];
     let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer_seeds);
     msg!("DEBUG: About to invoke token::transfer CPI");
     token::transfer(cpi_ctx, transfer_amount)?;
@@ -454,7 +441,7 @@ pub fn execute_swap_operation(
     // approximate price from vault balances and use slippage to compute min_out.
     execute_swap_logic_no_deser(
         ctx,
-        transfer_id,
+        stored_id,
         params,
         base_input_flag,
     )?;
@@ -831,13 +818,6 @@ pub fn parse_pool_state(pool_state: &UncheckedAccount) -> Result<Box<PoolState>>
     let pool_state_data = pool_state.try_borrow_data()?;
     let ps: PoolState = PoolState::try_deserialize(&mut &pool_state_data[..])?;
     Ok(Box::new(ps))
-}
-
-#[inline]
-pub fn parse_amm_config(amm_config: &UncheckedAccount) -> Result<Box<AmmConfig>> {
-    let data = amm_config.try_borrow_data()?;
-    let cfg: AmmConfig = AmmConfig::try_deserialize(&mut &data[..])?;
-    Ok(Box::new(cfg))
 }
 
 /// Lightweight parser: extract only keys and tick_spacing from PoolState raw bytes
