@@ -591,6 +591,7 @@ fn execute_actual_swap(
         transfer_id.as_ref(),
         &[ctx.bumps.operation_data]
     ]];
+    msg!("DEBUG: signer_seeds = {:?}", signer_seeds);
     
     // Execute Raydium swap
     do_swap_single_v2(
@@ -609,7 +610,7 @@ fn execute_actual_swap(
         out_vault,
         in_mint,
         out_mint,
-        ctx.accounts.operation_data.to_account_info(),
+        ctx.accounts.operation_data.to_account_info(), // payer
         &signer_seeds,
         swap_amount,
         min_amount_out,
@@ -696,7 +697,7 @@ pub fn execute_open_position(
     // Compute tick array start indices
     let lower_start = tick_array_start_index(p.tick_lower, pool_state.tick_spacing as i32);
     let upper_start = tick_array_start_index(p.tick_upper, pool_state.tick_spacing as i32);
-    msg!("DEBUG: lower_start: {}", lower_start, );
+    msg!("DEBUG: lower_start: {}, upper_start: {}", lower_start, upper_start);
     
     // Call Raydium open_position_v2 via helper
     let signer_seeds: &[&[&[u8]]] = &[&[

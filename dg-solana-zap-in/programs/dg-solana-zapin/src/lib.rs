@@ -189,7 +189,6 @@ pub mod dg_solana_zapin {
         helpers::execute_increase_liquidity(&ctx, transfer_id, &params, is_base_input)
     }
 
-
     /// Open-position step for ZapIn: creates the position NFT and state
     pub fn open_position_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
         let caller_key = ctx.accounts.caller.key();
@@ -206,10 +205,9 @@ pub mod dg_solana_zapin {
    
     /// Finalize step for ZapIn: marks the operation executed
     pub fn finalize_zap_in(mut ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
-        // let caller_key = ctx.accounts.caller.key();
-        // helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
-        // helpers::finalize_execute(&mut ctx, transfer_id)
-        Ok(())
+        let caller_key = ctx.accounts.caller.key();
+        helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
+        helpers::finalize_execute(&mut ctx, transfer_id)
     }
 
 
@@ -269,6 +267,12 @@ pub struct Execute<'info> {
     pub pda_token0: Account<'info, TokenAccount>,
     #[account(mut)]
     pub pda_token1: Account<'info, TokenAccount>,
+
+    // Caller-owned token accounts for caller-custody swap
+    #[account(mut)]
+    pub caller_ata0: Account<'info, TokenAccount>,
+    #[account(mut)]
+    pub caller_ata1: Account<'info, TokenAccount>,
 
     // Raydium CPI program
     pub clmm_program: Program<'info, AmmV3>,
