@@ -59,50 +59,6 @@ pub fn do_decrease_liquidity_v2<'a>(
     raydium_amm_v3::cpi::decrease_liquidity_v2(ctx, liquidity, amount_0_min, amount_1_min)
 }
 
-#[inline(never)]
-pub fn do_increase_liquidity_v2<'a>(
-    clmm_prog_ai: AccountInfo<'a>,
-    user_ai: AccountInfo<'a>,
-    pos_nft_account: AccountInfo<'a>,
-    pool_state: AccountInfo<'a>,
-    protocol_pos: AccountInfo<'a>,
-    personal_position: AccountInfo<'a>,
-    ta_lower: AccountInfo<'a>,
-    ta_upper: AccountInfo<'a>,
-    pda_token0: AccountInfo<'a>,
-    pda_token1: AccountInfo<'a>,
-    vault0: AccountInfo<'a>,
-    vault1: AccountInfo<'a>,
-    token_prog_ai: AccountInfo<'a>,
-    token22_prog_ai: AccountInfo<'a>,
-    mint0: AccountInfo<'a>,
-    mint1: AccountInfo<'a>,
-    signer_seeds: &[&[&[u8]]],
-    amount_0_max: u64,
-    amount_1_max: u64,
-    base_flag: bool,
-) -> Result<()> {
-    let accts = raydium_amm_v3::cpi::accounts::IncreaseLiquidityV2 {
-        nft_owner: user_ai,
-        nft_account: pos_nft_account,
-        pool_state,
-        protocol_position: protocol_pos,
-        personal_position,
-        tick_array_lower: ta_lower,
-        tick_array_upper: ta_upper,
-        token_account_0: pda_token0,
-        token_account_1: pda_token1,
-        token_vault_0: vault0,
-        token_vault_1: vault1,
-        token_program: token_prog_ai,
-        token_program_2022: token22_prog_ai,
-        vault_0_mint: mint0,
-        vault_1_mint: mint1,
-    };
-    let ctx = CpiContext::new(clmm_prog_ai, accts).with_signer(signer_seeds);
-    raydium_amm_v3::cpi::increase_liquidity_v2(ctx, 0, amount_0_max, amount_1_max, Some(base_flag))
-}
-
 pub fn load_token_amount(ai: &AccountInfo) -> Result<u64> {
     let Some(acc) = unpack_token_account(ai) else {
         msg!("not a valid SPL token account: {}", ai.key);
@@ -274,6 +230,7 @@ pub fn execute_increase_liquidity(
     
     // Compute liquidity amounts
     let (pre0, pre1) = calculate_liquidity_amounts(p, is_base_input)?;
+    msg!("DEBUG: pre0 = {}, pre1 = {}", pre0, pre1);
     
     // Use helper function to call Raydium increase_liquidity_v2
     let signer_seeds: &[&[&[u8]]] = &[&[
@@ -281,7 +238,6 @@ pub fn execute_increase_liquidity(
         transfer_id.as_ref(),
         &[ctx.bumps.operation_data]
     ]];
-    msg!("do_increase_liquidity_v2");
     msg!("DEBUG: About to call do_increase_liquidity_v2");
     do_increase_liquidity_v2(
         ctx.accounts.clmm_program.to_account_info(),
@@ -307,6 +263,54 @@ pub fn execute_increase_liquidity(
     )?;
     msg!("DEBUG: do_increase_liquidity_v2 completed successfully");
     Ok(())
+}
+
+
+#[inline(never)]
+pub fn do_increase_liquidity_v2<'a>(
+    clmm_prog_ai: AccountInfo<'a>,
+    user_ai: AccountInfo<'a>,
+    pos_nft_account: AccountInfo<'a>,
+    pool_state: AccountInfo<'a>,
+    protocol_pos: AccountInfo<'a>,
+    personal_position: AccountInfo<'a>,
+    ta_lower: AccountInfo<'a>,
+    ta_upper: AccountInfo<'a>,
+    pda_token0: AccountInfo<'a>,
+    pda_token1: AccountInfo<'a>,
+    vault0: AccountInfo<'a>,
+    vault1: AccountInfo<'a>,
+    token_prog_ai: AccountInfo<'a>,
+    token22_prog_ai: AccountInfo<'a>,
+    mint0: AccountInfo<'a>,
+    mint1: AccountInfo<'a>,
+    signer_seeds: &[&[&[u8]]],
+    amount_0_max: u64,
+    amount_1_max: u64,
+    base_flag: bool,
+) -> Result<()> {
+    let accts = raydium_amm_v3::cpi::accounts::IncreaseLiquidityV2 {
+        nft_owner: user_ai,
+        nft_account: pos_nft_account,
+        pool_state,
+        protocol_position: protocol_pos,
+        personal_position,
+        tick_array_lower: ta_lower,
+        tick_array_upper: ta_upper,
+        token_account_0: pda_token0,
+        token_account_1: pda_token1,
+        token_vault_0: vault0,
+        token_vault_1: vault1,
+        token_program: token_prog_ai,
+        token_program_2022: token22_prog_ai,
+        vault_0_mint: mint0,
+        vault_1_mint: mint1,
+    };
+    let ctx = CpiContext::new(clmm_prog_ai, accts).with_signer(signer_seeds);
+    msg!("DEBUG: About to call raydium_amm_v3::cpi::increase_liquidity_v2");
+    msg!("DEBUG: amount_0_max = {}, amount_1_max = {}", amount_0_max, amount_1_max);
+    msg!("DEBUG: base_flag = {}", base_flag);
+    raydium_amm_v3::cpi::increase_liquidity_v2(ctx, 0, amount_0_max, amount_1_max, Some(base_flag))
 }
 
 /// Finalize execute operation
@@ -571,13 +575,6 @@ fn execute_actual_swap(
     swap_amount: u64,
     min_amount_out: u64,
 ) -> Result<()> {
-    // PDA signer
-    let signer_seeds: &[&[&[u8]]] = &[&[
-        b"operation_data",
-        transfer_id.as_ref(),
-        &[ctx.bumps.operation_data]
-    ]];
-
     // Assemble input/output sides
     let (in_acc, out_acc, in_vault, out_vault, in_mint, out_mint) = if base_input_flag {
         (

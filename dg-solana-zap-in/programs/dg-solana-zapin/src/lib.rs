@@ -175,31 +175,35 @@ pub mod dg_solana_zapin {
         helpers::execute_swap_operation_wrapper(&ctx, transfer_id, &params, is_base_input, amount)
     }
 
+     /// Increase-liquidity step for ZapIn: supplies tokens to the position
+     pub fn increase_liquidity_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
+        let caller_key = ctx.accounts.caller.key();
+        helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
+        let action = ctx.accounts.operation_data.action.clone();
+        let params = match action {
+            ActionData::ZapIn(p) => p,
+            _ => return Err(error!(ErrorCode::InvalidParams)),
+        };
+        let is_base_input = ctx.accounts.operation_data.base_input_flag;
+        msg!("DEBUG: is_base_input = {}", is_base_input);
+        helpers::execute_increase_liquidity(&ctx, transfer_id, &params, is_base_input)
+    }
+
+
     /// Open-position step for ZapIn: creates the position NFT and state
     pub fn open_position_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
         let caller_key = ctx.accounts.caller.key();
         helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
-        let params = match &ctx.accounts.operation_data.action {
+        let action = ctx.accounts.operation_data.action.clone();
+        let params = match action {
             ActionData::ZapIn(p) => p,
             _ => return Err(error!(ErrorCode::InvalidParams)),
         };
-        helpers::execute_open_position_with_loading(&ctx, transfer_id, params)
-        Ok(())
+        msg!("DEBUG: params = {:?}", params);
+        helpers::execute_open_position_with_loading(&ctx, transfer_id, &params)
     }
 
-    /// Increase-liquidity step for ZapIn: supplies tokens to the position
-    pub fn increase_liquidity_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
-        // let caller_key = ctx.accounts.caller.key();
-        // helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
-        // let params = match &ctx.accounts.operation_data.action {
-        //     ActionData::ZapIn(p) => p,
-        //     _ => return Err(error!(ErrorCode::InvalidParams)),
-        // };
-        // let is_base_input = ctx.accounts.operation_data.base_input_flag;
-        // helpers::execute_increase_liquidity(&ctx, transfer_id, params, is_base_input)
-        Ok(())
-    }
-
+   
     /// Finalize step for ZapIn: marks the operation executed
     pub fn finalize_zap_in(mut ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
         // let caller_key = ctx.accounts.caller.key();
