@@ -216,11 +216,14 @@ pub fn execute_increase_liquidity(
         stored_id.as_ref(),
         &[ctx.bumps.operation_data]
     ]];
+
+    let positionNftAccount = 
     msg!("DEBUG: About to call do_increase_liquidity_v2");
     do_increase_liquidity_v2(
         ctx.accounts.clmm_program.to_account_info(),
-        ctx.accounts.caller.to_account_info(),
-        ctx.accounts.position_nft_account.to_account_info(),
+        ctx.accounts.operation_data.to_account_info(), // operation_data PDA is the signer
+        // ctx.accounts.position_nft_account.to_account_info(),
+        
         ctx.accounts.pool_state.to_account_info(),
         ctx.accounts.protocol_position.to_account_info(),
         ctx.accounts.personal_position.to_account_info(),
@@ -331,30 +334,6 @@ pub fn validate_operation_state(
     Ok(())
 }
 
-/// Validate account addresses
-#[inline(never)]
-pub fn validate_accounts_only(
-    ctx: &Context<Execute>,
-) -> Result<bool> {
-    msg!("DEBUG: About to validate account addresses and determine base input");
-    // Use lightweight key parser to avoid full PoolState deserialization on stack
-    let (amm_cfg_key, obs_key, mint0_key, mint1_key, vault0_key, vault1_key, tick_spacing) =
-        parse_pool_state_keys(&ctx.accounts.pool_state)?;
-
-    // Validate individual account addresses
-    validate_single_account(&ctx.accounts.amm_config.to_account_info().key, &amm_cfg_key, "amm_config")?;
-    validate_single_account(&ctx.accounts.observation_state.to_account_info().key, &obs_key, "observation_state")?;
-    validate_single_account(&ctx.accounts.token_mint_0.to_account_info().key, &mint0_key, "token_mint_0")?;
-    validate_single_account(&ctx.accounts.token_mint_1.to_account_info().key, &mint1_key, "token_mint_1")?;
-    validate_single_account(&ctx.accounts.token_vault_0.to_account_info().key, &vault0_key, "token_vault_0")?;
-    validate_single_account(&ctx.accounts.token_vault_1.to_account_info().key, &vault1_key, "token_vault_1")?;
-
-    // Determine which side is the input token
-    let is_base_input = mint0_key == *ctx.accounts.token_mint_0.to_account_info().key;
-    msg!("DEBUG: determine base_input = {} (tick_spacing={})", is_base_input, tick_spacing);
-    Ok(is_base_input)
-}
-
 /// Get is_base_input flag
 #[inline(never)]
 pub fn get_is_base_input(
@@ -441,7 +420,7 @@ pub fn execute_swap_operation(
 
     // Execute swap logic without deserializing pool_state/amm_config. We'll
     // approximate price from vault balances and use slippage to compute min_out.
-    execute_swap_logic_no_deser(
+    execute_swap_logic(
         ctx,
         stored_id,
         params,
@@ -452,30 +431,17 @@ pub fn execute_swap_operation(
 }
 
 // New: swap logic that avoids deserializing PoolState/AmmConfig
-fn execute_swap_logic_no_deser(
+fn execute_swap_logic(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
     params: &ZapInParams,
     base_input_flag: bool,
 ) -> Result<()> {
-    msg!("DEBUG: execute_swap_logic_no_deser start");
-
-    // Read vault balances to infer price: price ~ vault_out / vault_in
-    let vault0_bal = load_token_amount(&ctx.accounts.token_vault_0.to_account_info())? as u128;
-    let vault1_bal = load_token_amount(&ctx.accounts.token_vault_1.to_account_info())? as u128;
-    msg!("DEBUG: token_vault_0 balance: {}", vault0_bal);
-    msg!("DEBUG: token_vault_1 balance: {}", vault1_bal);
-
-    // Prevent division by zero
-    require!(vault0_bal > 0 && vault1_bal > 0, ErrorCode::InvalidParams);
-
-    // Compute a Q64.64-ish price approximation as u128 (price_q64 ~ (vault1/vault0) * 2^64)
-    // price_q64 = (vault1_bal << 64) / vault0_bal
-    let price_q64_u128 = ((vault1_bal as u128) << 64) / (vault0_bal as u128);
-    if price_q64_u128 == 0 {
-        msg!("DEBUG: computed price_q64_u128 == 0");
-        return err!(ErrorCode::InvalidParams);
-    }
+    msg!("DEBUG: execute_swap_logic start");
+    let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
+    let ps = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
+    let price_q64_u128 = ps.sqrt_price_x64;
+    drop(data);
     msg!("DEBUG: price_q64_u128: {}", price_q64_u128);
 
     // Use u128 arithmetic where possible to reduce U256 allocations
@@ -487,10 +453,9 @@ fn execute_swap_logic_no_deser(
         // amount_in * Q64 / price_q64
         (params.amount_in as u128).saturating_mul(Q64_U128) / price_q64_u128
     };
-
-    // Apply slippage only (we don't have fees without parsing AmmConfig). This is
-    // conservative: require user to provide enough slippage to accommodate fees.
-    let slip_bps = params.slippage_bps.min(10_000) as u128;
+    msg!("DEBUG: theoretical_out_u128: {}", theoretical_out_u128);
+    // Apply fixed 10% slippage (1000 bps)
+    let slip_bps = params.slippage_bps as u128;
     let one_slip = 10_000u128;
     let min_out_u128 = theoretical_out_u128.saturating_mul(one_slip.saturating_sub(slip_bps)) / one_slip;
     let min_amount_out = min_out_u128 as u64;
@@ -542,7 +507,6 @@ fn execute_swap_logic_no_deser(
 
     let swap_amount = swap_amount_u.to_underflow_u64();
     msg!("DEBUG: computed swap_amount: {}", swap_amount);
-
     // Execute the actual swap CPI
     execute_actual_swap(
         ctx,
@@ -552,7 +516,7 @@ fn execute_swap_logic_no_deser(
         min_amount_out,
     )?;
 
-    msg!("DEBUG: execute_swap_logic_no_deser completed successfully");
+    msg!("DEBUG: execute_swap_logic completed successfully");
     Ok(())
 }
 
@@ -664,9 +628,10 @@ pub fn do_swap_single_v2<'a>(
         output_vault_mint: output_mint,
     };
     let remaining_accounts = vec![tick_array_lower_ai, tick_array_upper_ai];
+    msg!("DEBUG: remaining_accounts: {:?}", remaining_accounts);
     let ctx = CpiContext::new(clmm_prog_ai, accts)
-        .with_signer(signer_seeds);
-        // .with_remaining_accounts(remaining_accounts);
+        .with_signer(signer_seeds)
+        .with_remaining_accounts(remaining_accounts);
     // let ctx = CpiContext::new_with_signer(clmm_prog_ai, accts, signer_seeds);
     msg!("DEBUG: About to call raydium_amm_v3::cpi::swap_v2");
     msg!("DEBUG: amount_in: {}", amount_in);
@@ -676,8 +641,6 @@ pub fn do_swap_single_v2<'a>(
 }
 
 
-
-
 /// Execute open_position operation (with pool_state loading)
 #[inline(never)]
 pub fn execute_open_position_with_loading(
@@ -685,8 +648,11 @@ pub fn execute_open_position_with_loading(
     transfer_id: [u8; 32],
     p: &ZapInParams,
 ) -> Result<()> {
-    let pool_state = parse_pool_state(&ctx.accounts.pool_state)?;
-    execute_open_position(ctx, transfer_id, p, &*pool_state)
+    msg!("DEBUG: About to start open_position logic");
+    let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
+    let pool_state = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
+    drop(data);
+    execute_open_position(ctx, transfer_id, p, &pool_state)
 }
 
 /// Execute open_position operation
@@ -817,60 +783,6 @@ pub fn do_open_position_v2<'a>(
     )
 }
 
-
-/// Parse PoolState data
-#[inline]
-pub fn parse_pool_state(pool_state: &UncheckedAccount) -> Result<Box<PoolState>> {
-    let pool_state_data = pool_state.try_borrow_data()?;
-    let ps: PoolState = PoolState::try_deserialize(&mut &pool_state_data[..])?;
-    Ok(Box::new(ps))
-}
-
-/// Lightweight parser: extract only keys and tick_spacing from PoolState raw bytes
-/// This avoids allocating the full PoolState struct on the stack (which can trigger
-/// stack-overflows when the struct is large). If the data is too small or parsing
-/// fails, fall back to full `parse_pool_state()`.
-#[inline]
-pub fn parse_pool_state_keys(pool_state: &UncheckedAccount) -> Result<(Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, Pubkey, i32)> {
-    let data = match pool_state.try_borrow_data() {
-        Ok(d) => d,
-        Err(e) => return Err(e.into()),
-    };
-    // Account discriminator (8) + 6 * 32 (pubkeys) + 4 (tick_spacing) = 8 + 192 + 4 = 204
-    if data.len() >= 204 {
-        // safe slicing and conversion to arrays
-        let amm_cfg_arr: [u8; 32] = data[8..40].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let obs_arr: [u8; 32] = data[40..72].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let mint0_arr: [u8; 32] = data[72..104].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let mint1_arr: [u8; 32] = data[104..136].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let vault0_arr: [u8; 32] = data[136..168].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let vault1_arr: [u8; 32] = data[168..200].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let tick_spacing_bytes: [u8; 4] = data[200..204].try_into().map_err(|_| error!(ErrorCode::InvalidParams))?;
-        let amm_cfg = Pubkey::new_from_array(amm_cfg_arr);
-        let obs = Pubkey::new_from_array(obs_arr);
-        let mint0 = Pubkey::new_from_array(mint0_arr);
-        let mint1 = Pubkey::new_from_array(mint1_arr);
-        let vault0 = Pubkey::new_from_array(vault0_arr);
-        let vault1 = Pubkey::new_from_array(vault1_arr);
-        let tick_spacing = i32::from_le_bytes(tick_spacing_bytes);
-        msg!("DEBUG: parse_pool_state_keys success: tick_spacing={}", tick_spacing);
-        return Ok((amm_cfg, obs, mint0, mint1, vault0, vault1, tick_spacing));
-    }
-
-    // Fallback: full deserialization (may allocate on stack)
-    msg!("DEBUG: parse_pool_state_keys falling back to full parse (data.len={})", data.len());
-    let boxed = parse_pool_state(pool_state)?;
-    Ok((
-        boxed.amm_config,
-        boxed.observation_key,
-        boxed.token_mint_0,
-        boxed.token_mint_1,
-        boxed.token_vault_0,
-        boxed.token_vault_1,
-        boxed.tick_spacing as i32,
-    ))
-}
-
 /// Validate a single account address
 #[inline]
 pub fn validate_single_account(
@@ -884,28 +796,3 @@ pub fn validate_single_account(
     Ok(())
 }
 
-/// Validate whether account addresses match
-#[inline(never)]
-pub fn validate_account_addresses_unchecked(
-    amm_config: &AccountInfo,
-    observation_state: &AccountInfo,
-    token_mint_0: &AccountInfo,
-    token_mint_1: &AccountInfo,
-    token_vault_0: &AccountInfo,
-    token_vault_1: &AccountInfo,
-    pool_state: &UncheckedAccount,
-) -> Result<()> {
-    msg!("DEBUG: About to validate account addresses with UncheckedAccount");
-    // Use lightweight parser to avoid full deserialization on stack
-    let (amm_cfg_key, obs_key, mint0_key, mint1_key, vault0_key, vault1_key, _tick_spacing) =
-        parse_pool_state_keys(pool_state)?;
-    // Validate individual account addresses
-    validate_single_account(&amm_config.key, &amm_cfg_key, "amm_config")?;
-    validate_single_account(&observation_state.key, &obs_key, "observation_state")?;
-    validate_single_account(&token_mint_0.key, &mint0_key, "token_mint_0")?;
-    validate_single_account(&token_mint_1.key, &mint1_key, "token_mint_1")?;
-    validate_single_account(&token_vault_0.key, &vault0_key, "token_vault_0")?;
-    validate_single_account(&token_vault_1.key, &vault1_key, "token_vault_1")?;
-    
-    Ok(())
-}
