@@ -267,22 +267,17 @@ pub struct Execute<'info> {
     pub pda_token0: Account<'info, TokenAccount>,
     #[account(mut)]
     pub pda_token1: Account<'info, TokenAccount>,
-
-    // Caller-owned token accounts for caller-custody swap
-    #[account(mut)]
-    pub caller_ata0: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub caller_ata1: Account<'info, TokenAccount>,
-
     // Raydium CPI program
     pub clmm_program: Program<'info, AmmV3>,
 
     // Raydium pool/position accounts (Unchecked to allow external program layout)
     /// CHECK: forwarded to Raydium
+    #[account(mut)]
     pub pool_state: UncheckedAccount<'info>,
     /// CHECK: forwarded to Raydium
     pub amm_config: UncheckedAccount<'info>,
     /// CHECK: forwarded to Raydium
+    #[account(mut)]
     pub observation_state: UncheckedAccount<'info>,
     /// CHECK: forwarded to Raydium
     pub protocol_position: UncheckedAccount<'info>,
@@ -301,8 +296,10 @@ pub struct Execute<'info> {
 
     // Token vaults and mints
     /// CHECK: forwarded to Raydium
+    #[account(mut)]
     pub token_vault_0: UncheckedAccount<'info>,
     /// CHECK: forwarded to Raydium
+    #[account(mut)]
     pub token_vault_1: UncheckedAccount<'info>,
     /// CHECK: forwarded to Raydium
     pub token_mint_0: UncheckedAccount<'info>,

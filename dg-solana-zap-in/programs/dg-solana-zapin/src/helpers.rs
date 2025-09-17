@@ -414,10 +414,12 @@ pub fn execute_swap_operation(
     // Build signer seeds using the stored transfer_id on the PDA; ensure it matches param
     let stored_id = ctx.accounts.operation_data.transfer_id;
     require!(stored_id == transfer_id, ErrorCode::InvalidTransferId);
+    let bump_seeds = ctx.bumps.operation_data;
+    msg!("DEBUG: bump_seeds: {}", bump_seeds);
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
         stored_id.as_ref(),
-        &[ctx.bumps.operation_data]
+        &[bump_seeds]
     ]];
 
     // Transfer from program_token_account -> PDA token account for the input side
@@ -584,12 +586,13 @@ fn execute_actual_swap(
     };
     
     msg!("raydium swap amount: {}", swap_amount);
-    
+    let bump_seeds = ctx.bumps.operation_data;
+    msg!("DEBUG: bump_seeds: {}", bump_seeds);
     // Prepare signer_seeds for PDA authority over program-owned token accounts
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
         transfer_id.as_ref(),
-        &[ctx.bumps.operation_data]
+        &[bump_seeds]
     ]];
     msg!("DEBUG: signer_seeds = {:?}", signer_seeds);
     
@@ -610,7 +613,8 @@ fn execute_actual_swap(
         out_vault,
         in_mint,
         out_mint,
-        ctx.accounts.operation_data.to_account_info(), // payer
+        // ctx.accounts.operation_data.to_account_info(), // payer
+        ctx.accounts.caller.to_account_info(), // payer changed to caller
         &signer_seeds,
         swap_amount,
         min_amount_out,
@@ -638,14 +642,14 @@ pub fn do_swap_single_v2<'a>(
     output_vault: AccountInfo<'a>,
     input_mint: AccountInfo<'a>,
     output_mint: AccountInfo<'a>,
-    operation_ai: AccountInfo<'a>,
+    payer: AccountInfo<'a>,
     signer_seeds: &[&[&[u8]]],
     amount_in: u64,
     min_out: u64,
     is_base_input: bool,
 ) -> Result<()> {
     let accts = raydium_amm_v3::cpi::accounts::SwapSingleV2 {
-        payer: operation_ai,
+        payer: payer,
         amm_config,
         pool_state,
         input_token_account: input_acc,
@@ -661,8 +665,9 @@ pub fn do_swap_single_v2<'a>(
     };
     let remaining_accounts = vec![tick_array_lower_ai, tick_array_upper_ai];
     let ctx = CpiContext::new(clmm_prog_ai, accts)
-        .with_signer(signer_seeds)
-        .with_remaining_accounts(remaining_accounts);
+        .with_signer(signer_seeds);
+        // .with_remaining_accounts(remaining_accounts);
+    // let ctx = CpiContext::new_with_signer(clmm_prog_ai, accts, signer_seeds);
     msg!("DEBUG: About to call raydium_amm_v3::cpi::swap_v2");
     msg!("DEBUG: amount_in: {}", amount_in);
     msg!("DEBUG: min_out: {}", min_out);
