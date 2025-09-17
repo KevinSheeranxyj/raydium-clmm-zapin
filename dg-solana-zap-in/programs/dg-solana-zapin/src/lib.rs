@@ -175,6 +175,19 @@ pub mod dg_solana_zapin {
         helpers::execute_swap_operation_wrapper(&ctx, transfer_id, &params, is_base_input, amount)
     }
 
+    /// Open-position step for ZapIn: creates the position NFT and state
+    pub fn open_position_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
+        let caller_key = ctx.accounts.caller.key();
+        helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
+        let action = ctx.accounts.operation_data.action.clone();
+        let params = match action {
+            ActionData::ZapIn(p) => p,
+            _ => return Err(error!(ErrorCode::InvalidParams)),
+        };
+        msg!("DEBUG: params = {:?}", params);
+        helpers::execute_open_position_with_loading(&ctx, transfer_id, &params)
+    }
+
      /// Increase-liquidity step for ZapIn: supplies tokens to the position
      pub fn increase_liquidity_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
         let caller_key = ctx.accounts.caller.key();
@@ -187,19 +200,6 @@ pub mod dg_solana_zapin {
         let is_base_input = ctx.accounts.operation_data.base_input_flag;
         msg!("DEBUG: is_base_input = {}", is_base_input);
         helpers::execute_increase_liquidity(&ctx, transfer_id, &params, is_base_input)
-    }
-
-    /// Open-position step for ZapIn: creates the position NFT and state
-    pub fn open_position_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
-        let caller_key = ctx.accounts.caller.key();
-        helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
-        let action = ctx.accounts.operation_data.action.clone();
-        let params = match action {
-            ActionData::ZapIn(p) => p,
-            _ => return Err(error!(ErrorCode::InvalidParams)),
-        };
-        msg!("DEBUG: params = {:?}", params);
-        helpers::execute_open_position_with_loading(&ctx, transfer_id, &params)
     }
 
    
@@ -295,7 +295,7 @@ pub struct Execute<'info> {
     // Position NFT
     /// CHECK: forwarded to Raydium
     pub position_nft_mint: UncheckedAccount<'info>,
-    /// CHECK: forwarded to Raydium
+    /// CHECK: 
     pub position_nft_account: UncheckedAccount<'info>,
 
     // Token vaults and mints
@@ -324,99 +324,6 @@ pub struct Execute<'info> {
     pub metadata_account: UncheckedAccount<'info>,
 }
 
-#[derive(Accounts)]
-#[instruction(transfer_id: [u8; 32])]
-pub struct ExecuteIncreaseLiquidity<'info> {
-    #[account(mut)]
-    pub operation_data: Account<'info, OperationData>,
-    pub caller: Signer<'info>,
-
-    pub clmm_program: Program<'info, AmmV3>,
-    /// Pays to mint the position
-    pub nft_owner: Signer<'info>,
-
-    /// The token account for nft
-    #[account(
-        constraint = nft_account.mint == personal_position.nft_mint,
-        token::token_program = token_program,
-    )]
-    pub nft_account: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    #[account(mut)]
-    pub pool_state: AccountLoader<'info, PoolState>,
-
-    #[account(
-        mut,
-        seeds = [
-            POSITION_SEED.as_bytes(),
-            pool_state.key().as_ref(),
-            &personal_position.tick_lower_index.to_be_bytes(),
-            &personal_position.tick_upper_index.to_be_bytes(),
-        ],
-        seeds::program = clmm_program,
-        bump,
-        constraint = protocol_position.pool_id == pool_state.key(),
-    )]
-    pub protocol_position: Box<Account<'info, ProtocolPositionState>>,
-
-    /// Increase liquidity for this position
-    #[account(mut, constraint = personal_position.pool_id == pool_state.key())]
-    pub personal_position: Box<Account<'info, PersonalPositionState>>,
-
-    /// Stores init state for the lower tick
-    #[account(mut, constraint = tick_array_lower.load()?.pool_id == pool_state.key())]
-    pub tick_array_lower: AccountLoader<'info, TickArrayState>,
-
-    /// Stores init state for the upper tick
-    #[account(mut, constraint = tick_array_upper.load()?.pool_id == pool_state.key())]
-    pub tick_array_upper: AccountLoader<'info, TickArrayState>,
-
-    /// The payer's token account for token_0
-    #[account(
-        mut,
-        token::mint = token_vault_0.mint
-    )]
-    pub token_account_0: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    /// The token account spending token_1 to mint the position
-    #[account(
-        mut,
-        token::mint = token_vault_1.mint
-    )]
-    pub token_account_1: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    /// The address that holds pool tokens for token_0
-    #[account(
-        mut,
-        constraint = token_vault_0.key() == pool_state.load()?.token_vault_0
-    )]
-    pub token_vault_0: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    /// The address that holds pool tokens for token_1
-    #[account(
-        mut,
-        constraint = token_vault_1.key() == pool_state.load()?.token_vault_1
-    )]
-    pub token_vault_1: Box<InterfaceAccount<'info, TokenAccount>>,
-
-    /// Program to create mint account and mint tokens
-    pub token_program: Program<'info, Token>,
-
-    /// Token program 2022
-    pub token_program_2022: Program<'info, Token2022>,
-
-    /// The mint of token vault 0
-    #[account(
-            address = token_vault_0.mint
-    )]
-    pub vault_0_mint: Box<InterfaceAccount<'info, Mint>>,
-
-    /// The mint of token vault 1
-    #[account(
-            address = token_vault_1.mint
-    )]
-    pub vault_1_mint: Box<InterfaceAccount<'info, Mint>>,
-}
 
 #[derive(Accounts)]
 pub struct Initialize<'info> {

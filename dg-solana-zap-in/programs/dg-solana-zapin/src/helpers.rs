@@ -222,8 +222,7 @@ pub fn execute_increase_liquidity(
     do_increase_liquidity_v2(
         ctx.accounts.clmm_program.to_account_info(),
         ctx.accounts.operation_data.to_account_info(), // operation_data PDA is the signer
-        // ctx.accounts.position_nft_account.to_account_info(),
-        
+        ctx.accounts.position_nft_account.to_account_info(), // position_nft_account
         ctx.accounts.pool_state.to_account_info(),
         ctx.accounts.protocol_position.to_account_info(),
         ctx.accounts.personal_position.to_account_info(),
@@ -649,10 +648,11 @@ pub fn execute_open_position_with_loading(
     p: &ZapInParams,
 ) -> Result<()> {
     msg!("DEBUG: About to start open_position logic");
-    let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
-    let pool_state = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
-    drop(data);
-    execute_open_position(ctx, transfer_id, p, &pool_state)
+    // let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
+    // let pool_state = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
+    // drop(data);
+    // execute_open_position(ctx, transfer_id, p, &pool_state)
+    Ok(())
 }
 
 /// Execute open_position operation
