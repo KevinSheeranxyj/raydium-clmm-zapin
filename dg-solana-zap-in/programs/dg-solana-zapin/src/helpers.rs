@@ -656,12 +656,12 @@ pub fn execute_open_position(
     let lower_start = tick_array_start_index(p.tick_lower, pool_state.tick_spacing as i32);
     let upper_start = tick_array_start_index(p.tick_upper, pool_state.tick_spacing as i32);
     msg!("DEBUG: lower_start: {}, upper_start: {}", lower_start, upper_start);
-    
+    let bump_seeds = ctx.bumps.operation_data;
     // Call Raydium open_position_v2 via helper
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
         transfer_id.as_ref(),
-        &[ctx.bumps.operation_data]
+        &[bump_seeds]
     ]];
     msg!("do_open_position_v2");
     msg!("DEBUG: About to call do_open_position_v2");
@@ -694,6 +694,7 @@ pub fn execute_open_position(
         lower_start,
         upper_start,
         signer_seeds,
+        ctx.accounts.operation_data.base_input_flag,
     )?;
     msg!("DEBUG: do_open_position_v2 completed successfully");
     Ok(())
@@ -729,6 +730,7 @@ pub fn do_open_position_v2<'a>(
     lower_start: i32,
     upper_start: i32,
     signer_seeds: &[&[&[u8]]],
+    base_flag: bool,
 ) -> Result<()> {
     let accts = raydium_amm_v3::cpi::accounts::OpenPositionV2 {
         payer: operation_ai,
@@ -740,7 +742,6 @@ pub fn do_open_position_v2<'a>(
         protocol_position: protocol_pos,
         tick_array_lower: ta_lower,
         tick_array_upper: ta_upper,
-        personal_position: personal_position,
         token_program: token_prog_ai,
         system_program: system_prog_ai,
         rent: rent_sysvar_ai,
@@ -755,6 +756,7 @@ pub fn do_open_position_v2<'a>(
         metadata_account: metadata_account_ai,
         token_program_2022: token22_prog_ai,
     };
+    msg!("DEBUG: base_flag: {}", base_flag);
     let ctx = CpiContext::new(clmm_prog_ai, accts).with_signer(signer_seeds);
     raydium_amm_v3::cpi::open_position_v2(
         ctx,
@@ -762,11 +764,11 @@ pub fn do_open_position_v2<'a>(
         tick_upper,
         lower_start,
         upper_start,
-        0u128,
-        0u64,
-        0u64,
+        0u128, // liquidity
+        0u64, // amount_0_max
+        0u64, // amount_1_max
         false,          // with_metadata (Raydium will use provided metadata PDA)
-        Some(true),     // base_flag
+        Some(base_flag),
     )
 }
 
