@@ -646,6 +646,7 @@ pub fn do_swap_single_v2<'a>(
 pub fn execute_open_position(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
+    is_base_input: bool,
     p: &ZapInParams,
 ) -> Result<()> {
     msg!("DEBUG: About to start open_position logic");
@@ -667,9 +668,9 @@ pub fn execute_open_position(
     msg!("DEBUG: About to call do_open_position_v2");
     do_open_position_v2(
         ctx.accounts.clmm_program.to_account_info(),
-        ctx.accounts.operation_data.to_account_info(),
-        ctx.accounts.pool_state.to_account_info(),
         ctx.accounts.caller.to_account_info(),
+        ctx.accounts.pool_state.to_account_info(),
+        ctx.accounts.operation_data.to_account_info(),
         ctx.accounts.position_nft_mint.to_account_info(),
         ctx.accounts.position_nft_account.to_account_info(),
         ctx.accounts.personal_position.to_account_info(),
@@ -694,7 +695,7 @@ pub fn execute_open_position(
         lower_start,
         upper_start,
         signer_seeds,
-        ctx.accounts.operation_data.base_input_flag,
+        is_base_input,
     )?;
     msg!("DEBUG: do_open_position_v2 completed successfully");
     Ok(())

@@ -187,7 +187,9 @@ pub mod dg_solana_zapin {
         let stored_id = ctx.accounts.operation_data.transfer_id;
         require!(stored_id == transfer_id, ErrorCode::InvalidTransferId);
         msg!("DEBUG: params = {:?}", params);
-        helpers::execute_open_position(&ctx, stored_id, &params)
+        let is_base_input = helpers::get_is_base_input(&ctx)?;
+        msg!("DEBUG: is_base_input = {}", is_base_input);
+        helpers::execute_open_position(&ctx, stored_id, is_base_input, &params)
     }
 
      /// Increase-liquidity step for ZapIn: supplies tokens to the position
