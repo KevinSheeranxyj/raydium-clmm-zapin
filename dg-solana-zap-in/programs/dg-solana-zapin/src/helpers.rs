@@ -11,6 +11,11 @@ use crate::state::{ZapInParams, ActionData};
 use crate::Execute;
 use anchor_lang::solana_program::program_pack::Pack;
 use anchor_lang::solana_program::keccak::hash;
+
+use anchor_spl::associated_token as ata;
+use anchor_spl::associated_token::get_associated_token_address_with_program_id;
+use anchor_spl::token_interface::spl_token_2022::ID as TOKEN_2022_ID; // 若用 Token-2022
+
 const Q64_U128: u128 = 1u128 << 64;
 
 
@@ -439,6 +444,7 @@ fn execute_swap_logic(
     msg!("DEBUG: execute_swap_logic start");
     let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
     let ps = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
+    msg!("DEBUG: {:?}", ps);
     let price_q64_u128 = ps.sqrt_price_x64;
     drop(data);
     msg!("DEBUG: price_q64_u128: {}", price_q64_u128);
@@ -645,7 +651,6 @@ pub fn do_swap_single_v2<'a>(
 #[inline(never)]
 pub fn execute_open_position(
     ctx: &Context<Execute>,
-    transfer_id: [u8; 32],
     is_base_input: bool,
     p: &ZapInParams,
 ) -> Result<()> {
@@ -659,18 +664,53 @@ pub fn execute_open_position(
     msg!("DEBUG: lower_start: {}, upper_start: {}", lower_start, upper_start);
     let bump_seeds = ctx.bumps.operation_data;
     // Call Raydium open_position_v2 via helper
+    let stored_id = ctx.accounts.operation_data.transfer_id;
     let signer_seeds: &[&[&[u8]]] = &[&[
         b"operation_data",
-        transfer_id.as_ref(),
-        &[bump_seeds]
+        stored_id.as_ref(),
+        &[bump_seeds],
     ]];
+
+    let owner_pda = ctx.accounts.operation_data.key();
+    let mint_key = ctx.accounts.position_nft_mint.key();
+    msg!("DEBUG: owner_pda: {}", owner_pda);
+    msg!("DEBUG: mint_key: {}", mint_key);
+    let expected_ata = get_associated_token_address_with_program_id(
+        &owner_pda,
+        &mint_key,
+        &ctx.accounts.token_program_2022.key(), // 或 TOKEN_2022_ID
+    );
+    require_keys_eq!(ctx.accounts.position_nft_account.key(), expected_ata, ErrorCode::InvalidParams);
+    
+    if ctx.accounts.position_nft_account.lamports() == 0 {
+        let bump = ctx.bumps.operation_data;
+        let signer_seeds: &[&[&[u8]]] = &[&[
+            b"operation_data",
+            ctx.accounts.operation_data.transfer_id.as_ref(), // 用账户里保存的 id
+            &[bump],
+        ]];
+    
+        let cpi_ctx = CpiContext::new(
+            ctx.accounts.associated_token_program.to_account_info(),
+            ata::Create {
+                payer:            ctx.accounts.operation_data.to_account_info(),      // PDA 付费
+                associated_token: ctx.accounts.position_nft_account.to_account_info(),// 要创建的 ATA
+                authority:        ctx.accounts.operation_data.to_account_info(),      // ATA owner = PDA
+                mint:             ctx.accounts.position_nft_mint.to_account_info(),
+                system_program:   ctx.accounts.system_program.to_account_info(),
+                token_program:    ctx.accounts.token_program_2022.to_account_info(),  // Token-2022
+            },
+        ).with_signer(signer_seeds);
+    
+        ata::create(cpi_ctx)?;
+    }
     msg!("do_open_position_v2");
     msg!("DEBUG: About to call do_open_position_v2");
     do_open_position_v2(
         ctx.accounts.clmm_program.to_account_info(),
-        ctx.accounts.caller.to_account_info(),
+        ctx.accounts.operation_data.to_account_info(), // payer = PDA
         ctx.accounts.pool_state.to_account_info(),
-        ctx.accounts.operation_data.to_account_info(),
+        ctx.accounts.operation_data.to_account_info(), // position_nft_owner = PDA
         ctx.accounts.position_nft_mint.to_account_info(),
         ctx.accounts.position_nft_account.to_account_info(),
         ctx.accounts.personal_position.to_account_info(),
@@ -758,7 +798,7 @@ pub fn do_open_position_v2<'a>(
         token_program_2022: token22_prog_ai,
     };
     msg!("DEBUG: base_flag: {}", base_flag);
-    let ctx = CpiContext::new(clmm_prog_ai, accts).with_signer(signer_seeds);
+    let ctx = CpiContext::new_with_signer(clmm_prog_ai, accts, signer_seeds);
     raydium_amm_v3::cpi::open_position_v2(
         ctx,
         tick_lower,
