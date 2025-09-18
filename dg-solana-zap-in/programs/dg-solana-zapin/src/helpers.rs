@@ -15,6 +15,10 @@ use anchor_lang::solana_program::keccak::hash;
 use anchor_spl::associated_token as ata;
 use anchor_spl::associated_token::get_associated_token_address_with_program_id;
 use anchor_spl::token_interface::spl_token_2022::ID as TOKEN_2022_ID; // 若用 Token-2022
+use spl_token_2022::state::Mint as Mint22;
+use anchor_lang::solana_program::{system_instruction, program::invoke_signed};
+use anchor_lang::prelude::Rent;
+use anchor_lang::prelude::SolanaSysvar;
 
 const Q64_U128: u128 = 1u128 << 64;
 
@@ -200,103 +204,103 @@ pub fn calculate_liquidity_amounts(
 }
 
 /// Execute increase_liquidity operation
-#[inline(never)]
-pub fn execute_increase_liquidity(
-    ctx: &Context<Execute>,
-    transfer_id: [u8; 32],
-    p: &ZapInParams,
-    is_base_input: bool,
-) -> Result<()> {
-    msg!("DEBUG: About to start increase_liquidity logic");
+// #[inline(never)]
+// pub fn execute_increase_liquidity(
+//     ctx: &Context<Execute>,
+//     transfer_id: [u8; 32],
+//     p: &ZapInParams,
+//     is_base_input: bool,
+// ) -> Result<()> {
+//     msg!("DEBUG: About to start increase_liquidity logic");
     
-    // Compute liquidity amounts
-    let (pre0, pre1) = calculate_liquidity_amounts(p, is_base_input)?;
-    msg!("DEBUG: pre0 = {}, pre1 = {}", pre0, pre1);
+//     // Compute liquidity amounts
+//     let (pre0, pre1) = calculate_liquidity_amounts(p, is_base_input)?;
+//     msg!("DEBUG: pre0 = {}, pre1 = {}", pre0, pre1);
     
-    // Use helper function to call Raydium increase_liquidity_v2
-    let stored_id = ctx.accounts.operation_data.transfer_id;
-    require!(stored_id == transfer_id, ErrorCode::InvalidTransferId);
-    let signer_seeds: &[&[&[u8]]] = &[&[
-        b"operation_data",
-        stored_id.as_ref(),
-        &[ctx.bumps.operation_data]
-    ]];
+//     // Use helper function to call Raydium increase_liquidity_v2
+//     let stored_id = ctx.accounts.operation_data.transfer_id;
+//     require!(stored_id == transfer_id, ErrorCode::InvalidTransferId);
+//     let signer_seeds: &[&[&[u8]]] = &[&[
+//         b"operation_data",
+//         stored_id.as_ref(),
+//         &[ctx.bumps.operation_data]
+//     ]];
 
-    let positionNftAccount = 
-    msg!("DEBUG: About to call do_increase_liquidity_v2");
-    do_increase_liquidity_v2(
-        ctx.accounts.clmm_program.to_account_info(),
-        ctx.accounts.operation_data.to_account_info(), // operation_data PDA is the signer
-        ctx.accounts.position_nft_account.to_account_info(), // position_nft_account
-        ctx.accounts.pool_state.to_account_info(),
-        ctx.accounts.protocol_position.to_account_info(),
-        ctx.accounts.personal_position.to_account_info(),
-        ctx.accounts.tick_array_lower.to_account_info(),
-        ctx.accounts.tick_array_upper.to_account_info(),
-        ctx.accounts.pda_token0.to_account_info(),
-        ctx.accounts.pda_token1.to_account_info(),
-        ctx.accounts.token_vault_0.to_account_info(),
-        ctx.accounts.token_vault_1.to_account_info(),
-        ctx.accounts.token_program.to_account_info(),
-        ctx.accounts.token_program_2022.to_account_info(),
-        ctx.accounts.token_mint_0.to_account_info(),
-        ctx.accounts.token_mint_1.to_account_info(),
-        signer_seeds,
-        pre0,
-        pre1,
-        is_base_input,
-    )?;
-    msg!("DEBUG: do_increase_liquidity_v2 completed successfully");
-    Ok(())
-}
+//     let positionNftAccount = 
+//     msg!("DEBUG: About to call do_increase_liquidity_v2");
+//     do_increase_liquidity_v2(
+//         ctx.accounts.clmm_program.to_account_info(),
+//         ctx.accounts.operation_data.to_account_info(), // operation_data PDA is the signer
+//         ctx.accounts.position_nft_account.to_account_info(), // position_nft_account
+//         ctx.accounts.pool_state.to_account_info(),
+//         ctx.accounts.protocol_position.to_account_info(),
+//         ctx.accounts.personal_position.to_account_info(),
+//         ctx.accounts.tick_array_lower.to_account_info(),
+//         ctx.accounts.tick_array_upper.to_account_info(),
+//         ctx.accounts.pda_token0.to_account_info(),
+//         ctx.accounts.pda_token1.to_account_info(),
+//         ctx.accounts.token_vault_0.to_account_info(),
+//         ctx.accounts.token_vault_1.to_account_info(),
+//         ctx.accounts.token_program.to_account_info(),
+//         ctx.accounts.token_program_2022.to_account_info(),
+//         ctx.accounts.token_mint_0.to_account_info(),
+//         ctx.accounts.token_mint_1.to_account_info(),
+//         signer_seeds,
+//         pre0,
+//         pre1,
+//         is_base_input,
+//     )?;
+//     msg!("DEBUG: do_increase_liquidity_v2 completed successfully");
+//     Ok(())
+// }
 
 
-#[inline(never)]
-pub fn do_increase_liquidity_v2<'a>(
-    clmm_prog_ai: AccountInfo<'a>,
-    user_ai: AccountInfo<'a>,
-    pos_nft_account: AccountInfo<'a>,
-    pool_state: AccountInfo<'a>,
-    protocol_pos: AccountInfo<'a>,
-    personal_position: AccountInfo<'a>,
-    ta_lower: AccountInfo<'a>,
-    ta_upper: AccountInfo<'a>,
-    pda_token0: AccountInfo<'a>,
-    pda_token1: AccountInfo<'a>,
-    vault0: AccountInfo<'a>,
-    vault1: AccountInfo<'a>,
-    token_prog_ai: AccountInfo<'a>,
-    token22_prog_ai: AccountInfo<'a>,
-    mint0: AccountInfo<'a>,
-    mint1: AccountInfo<'a>,
-    signer_seeds: &[&[&[u8]]],
-    amount_0_max: u64,
-    amount_1_max: u64,
-    base_flag: bool,
-) -> Result<()> {
-    let accts = raydium_amm_v3::cpi::accounts::IncreaseLiquidityV2 {
-        nft_owner: user_ai,
-        nft_account: pos_nft_account,
-        pool_state,
-        protocol_position: protocol_pos,
-        personal_position,
-        tick_array_lower: ta_lower,
-        tick_array_upper: ta_upper,
-        token_account_0: pda_token0,
-        token_account_1: pda_token1,
-        token_vault_0: vault0,
-        token_vault_1: vault1,
-        token_program: token_prog_ai,
-        token_program_2022: token22_prog_ai,
-        vault_0_mint: mint0,
-        vault_1_mint: mint1,
-    };
-    let ctx = CpiContext::new(clmm_prog_ai, accts).with_signer(signer_seeds);
-    msg!("DEBUG: About to call raydium_amm_v3::cpi::increase_liquidity_v2");
-    msg!("DEBUG: amount_0_max = {}, amount_1_max = {}", amount_0_max, amount_1_max);
-    msg!("DEBUG: base_flag = {}", base_flag);
-    raydium_amm_v3::cpi::increase_liquidity_v2(ctx, 0, amount_0_max, amount_1_max, Some(base_flag))
-}
+// #[inline(never)]
+// pub fn do_increase_liquidity_v2<'a>(
+//     clmm_prog_ai: AccountInfo<'a>,
+//     user_ai: AccountInfo<'a>,
+//     pos_nft_account: AccountInfo<'a>,
+//     pool_state: AccountInfo<'a>,
+//     protocol_pos: AccountInfo<'a>,
+//     personal_position: AccountInfo<'a>,
+//     ta_lower: AccountInfo<'a>,
+//     ta_upper: AccountInfo<'a>,
+//     pda_token0: AccountInfo<'a>,
+//     pda_token1: AccountInfo<'a>,
+//     vault0: AccountInfo<'a>,
+//     vault1: AccountInfo<'a>,
+//     token_prog_ai: AccountInfo<'a>,
+//     token22_prog_ai: AccountInfo<'a>,
+//     mint0: AccountInfo<'a>,
+//     mint1: AccountInfo<'a>,
+//     signer_seeds: &[&[&[u8]]],
+//     amount_0_max: u64,
+//     amount_1_max: u64,
+//     base_flag: bool,
+// ) -> Result<()> {
+//     let accts = raydium_amm_v3::cpi::accounts::IncreaseLiquidityV2 {
+//         nft_owner: user_ai,
+//         nft_account: pos_nft_account,
+//         pool_state,
+//         protocol_position: protocol_pos,
+//         personal_position,
+//         tick_array_lower: ta_lower,
+//         tick_array_upper: ta_upper,
+//         token_account_0: pda_token0,
+//         token_account_1: pda_token1,
+//         token_vault_0: vault0,
+//         token_vault_1: vault1,
+//         token_program: token_prog_ai,
+//         token_program_2022: token22_prog_ai,
+//         vault_0_mint: mint0,
+//         vault_1_mint: mint1,
+//     };
+//     let ctx = CpiContext::new(clmm_prog_ai, accts).with_signer(signer_seeds);
+//     msg!("DEBUG: About to call raydium_amm_v3::cpi::increase_liquidity_v2");
+//     msg!("DEBUG: amount_0_max = {}, amount_1_max = {}", amount_0_max, amount_1_max);
+//     msg!("DEBUG: base_flag = {}", base_flag);
+//     raydium_amm_v3::cpi::increase_liquidity_v2(ctx, 0, amount_0_max, amount_1_max, Some(base_flag))
+// }
 
 /// Finalize execute operation
 #[inline]
@@ -444,7 +448,6 @@ fn execute_swap_logic(
     msg!("DEBUG: execute_swap_logic start");
     let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
     let ps = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
-    msg!("DEBUG: {:?}", ps);
     let price_q64_u128 = ps.sqrt_price_x64;
     drop(data);
     msg!("DEBUG: price_q64_u128: {}", price_q64_u128);
@@ -526,8 +529,8 @@ fn execute_swap_logic(
 }
 
 /// Execute the actual swap CPI
-fn execute_actual_swap(
-    ctx: &Context<Execute>,
+fn execute_actual_swap<'info>(
+    ctx: &Context<'_, '_, '_, 'info, Execute<'info>>,
     transfer_id: [u8; 32],
     base_input_flag: bool,
     swap_amount: u64,
@@ -564,7 +567,7 @@ fn execute_actual_swap(
         &[bump_seeds]
     ]];
     msg!("DEBUG: signer_seeds = {:?}", signer_seeds);
-    
+    let remaining_accounts = ctx.remaining_accounts.to_vec();
     // Execute Raydium swap
     do_swap_single_v2(
         ctx.accounts.clmm_program.to_account_info(),
@@ -574,8 +577,7 @@ fn execute_actual_swap(
         ctx.accounts.amm_config.to_account_info(),
         ctx.accounts.pool_state.to_account_info(),
         ctx.accounts.observation_state.to_account_info(),
-        ctx.accounts.tick_array_lower.to_account_info(),
-        ctx.accounts.tick_array_upper.to_account_info(),
+        remaining_accounts,
         in_acc,
         out_acc,
         in_vault,
@@ -603,8 +605,7 @@ pub fn do_swap_single_v2<'a>(
     amm_config: AccountInfo<'a>,
     pool_state: AccountInfo<'a>,
     observation: AccountInfo<'a>,
-    tick_array_lower_ai: AccountInfo<'a>,
-    tick_array_upper_ai: AccountInfo<'a>,
+    tick_arrays: Vec<AccountInfo<'a>>, // from remaining_accounts: at least 2
     input_acc: AccountInfo<'a>,
     output_acc: AccountInfo<'a>,
     input_vault: AccountInfo<'a>,
@@ -632,11 +633,9 @@ pub fn do_swap_single_v2<'a>(
         input_vault_mint: input_mint,
         output_vault_mint: output_mint,
     };
-    let remaining_accounts = vec![tick_array_lower_ai, tick_array_upper_ai];
-    msg!("DEBUG: remaining_accounts: {:?}", remaining_accounts);
     let ctx = CpiContext::new(clmm_prog_ai, accts)
         .with_signer(signer_seeds)
-        .with_remaining_accounts(remaining_accounts);
+        .with_remaining_accounts(tick_arrays);
     // let ctx = CpiContext::new_with_signer(clmm_prog_ai, accts, signer_seeds);
     msg!("DEBUG: About to call raydium_amm_v3::cpi::swap_v2");
     msg!("DEBUG: amount_in: {}", amount_in);
@@ -649,8 +648,8 @@ pub fn do_swap_single_v2<'a>(
 
 /// Execute open_position operation
 #[inline(never)]
-pub fn execute_open_position(
-    ctx: &Context<Execute>,
+pub fn execute_open_position<'info>(
+    ctx: &Context<'_, '_, '_, 'info, Execute<'info>>,
     is_base_input: bool,
     p: &ZapInParams,
 ) -> Result<()> {
@@ -706,6 +705,10 @@ pub fn execute_open_position(
     }
     msg!("do_open_position_v2");
     msg!("DEBUG: About to call do_open_position_v2");
+    // Take tick arrays from remaining_accounts
+    let ta_lower_ai = ctx.remaining_accounts[0].clone();
+    let ta_upper_ai = ctx.remaining_accounts[1].clone();
+
     do_open_position_v2(
         ctx.accounts.clmm_program.to_account_info(),
         ctx.accounts.operation_data.to_account_info(), // payer = PDA
@@ -715,8 +718,8 @@ pub fn execute_open_position(
         ctx.accounts.position_nft_account.to_account_info(),
         ctx.accounts.personal_position.to_account_info(),
         ctx.accounts.protocol_position.to_account_info(),
-        ctx.accounts.tick_array_lower.to_account_info(),
-        ctx.accounts.tick_array_upper.to_account_info(),
+        ta_lower_ai,
+        ta_upper_ai,
         ctx.accounts.token_program.to_account_info(),
         ctx.accounts.system_program.to_account_info(),
         ctx.accounts.rent.to_account_info(),
