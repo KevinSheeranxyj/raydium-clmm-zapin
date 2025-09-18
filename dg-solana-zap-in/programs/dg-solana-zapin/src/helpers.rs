@@ -640,20 +640,6 @@ pub fn do_swap_single_v2<'a>(
 }
 
 
-/// Execute open_position operation (with pool_state loading)
-#[inline(never)]
-pub fn execute_open_position_with_loading(
-    ctx: &Context<Execute>,
-    transfer_id: [u8; 32],
-    p: &ZapInParams,
-) -> Result<()> {
-    msg!("DEBUG: About to start open_position logic");
-    // let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
-    // let pool_state = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
-    // drop(data);
-    // execute_open_position(ctx, transfer_id, p, &pool_state)
-    Ok(())
-}
 
 /// Execute open_position operation
 #[inline(never)]
@@ -661,11 +647,12 @@ pub fn execute_open_position(
     ctx: &Context<Execute>,
     transfer_id: [u8; 32],
     p: &ZapInParams,
-    pool_state: &PoolState,
 ) -> Result<()> {
     msg!("DEBUG: About to start open_position logic");
-    
     // Compute tick array start indices
+    let mut data = ctx.accounts.pool_state.try_borrow_mut_data()?;
+    let pool_state = raydium_amm_v3::states::PoolState::try_deserialize(&mut &data[..])?;
+    drop(data);
     let lower_start = tick_array_start_index(p.tick_lower, pool_state.tick_spacing as i32);
     let upper_start = tick_array_start_index(p.tick_upper, pool_state.tick_spacing as i32);
     msg!("DEBUG: lower_start: {}, upper_start: {}", lower_start, upper_start);
@@ -678,7 +665,6 @@ pub fn execute_open_position(
     ]];
     msg!("do_open_position_v2");
     msg!("DEBUG: About to call do_open_position_v2");
-    msg!("DEBUG: operation_data key before open_position: {}", ctx.accounts.operation_data.key());
     do_open_position_v2(
         ctx.accounts.clmm_program.to_account_info(),
         ctx.accounts.operation_data.to_account_info(),
@@ -754,6 +740,7 @@ pub fn do_open_position_v2<'a>(
         protocol_position: protocol_pos,
         tick_array_lower: ta_lower,
         tick_array_upper: ta_upper,
+        personal_position: personal_position,
         token_program: token_prog_ai,
         system_program: system_prog_ai,
         rent: rent_sysvar_ai,
@@ -794,5 +781,91 @@ pub fn validate_single_account(
     require!(*account_key == *expected_key, ErrorCode::InvalidParams);
     msg!("DEBUG: {} validation passed", account_name);
     Ok(())
+}
+
+/// Compute the expected Raydium CLMM tick array PDA for a given pool and start index
+pub fn expected_tick_array_pubkey(
+    clmm_program_id: &Pubkey,
+    pool_pubkey: &Pubkey,
+    start_index: i32,
+) -> Pubkey {
+    use raydium_amm_v3::states::TICK_ARRAY_SEED;
+    let (pda, _bump) = Pubkey::find_program_address(
+        &[
+            TICK_ARRAY_SEED.as_ref(),
+            pool_pubkey.as_ref(),
+            &start_index.to_le_bytes(),
+        ],
+        clmm_program_id,
+    );
+    pda
+}
+
+/// Validate provided tick array pubkeys match the expected PDAs for the given starts
+pub fn validate_tick_array_pubkeys(
+    clmm_program_id: &Pubkey,
+    pool_pubkey: &Pubkey,
+    lower_start: i32,
+    upper_start: i32,
+    provided_lower: &Pubkey,
+    provided_upper: &Pubkey,
+) -> bool {
+    let exp_lower = expected_tick_array_pubkey(clmm_program_id, pool_pubkey, lower_start);
+    let exp_upper = expected_tick_array_pubkey(clmm_program_id, pool_pubkey, upper_start);
+    *provided_lower == exp_lower && *provided_upper == exp_upper
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use anchor_lang::prelude::Pubkey;
+
+    #[test]
+    fn test_tick_array_start_index_rounding() {
+        // span = 60 * 88 = 5280
+        let span = 60 * 88;
+        // Positive ticks
+        assert_eq!(tick_array_start_index(0, span), 0);
+        assert_eq!(tick_array_start_index(1, span), 0);
+        assert_eq!(tick_array_start_index(5279, span), 0);
+        assert_eq!(tick_array_start_index(5280, span), 5280);
+        // Negative ticks
+        assert_eq!(tick_array_start_index(-1, span), -5280);
+        assert_eq!(tick_array_start_index(-5279, span), -5280);
+        assert_eq!(tick_array_start_index(-5280, span), -5280);
+        assert_eq!(tick_array_start_index(-5281, span), -10560);
+    }
+
+    #[test]
+    fn test_validate_tick_array_pubkeys_ok_and_fail() {
+        let clmm_program_id = Pubkey::new_unique();
+        let pool_pubkey = Pubkey::new_unique();
+        let lower_start: i32 = 0;
+        let upper_start: i32 = 5280;
+
+        let lower_pda = expected_tick_array_pubkey(&clmm_program_id, &pool_pubkey, lower_start);
+        let upper_pda = expected_tick_array_pubkey(&clmm_program_id, &pool_pubkey, upper_start);
+
+        // OK case
+        assert!(validate_tick_array_pubkeys(
+            &clmm_program_id,
+            &pool_pubkey,
+            lower_start,
+            upper_start,
+            &lower_pda,
+            &upper_pda,
+        ));
+
+        // FAIL case - wrong upper
+        let wrong_upper = Pubkey::new_unique();
+        assert!(!validate_tick_array_pubkeys(
+            &clmm_program_id,
+            &pool_pubkey,
+            lower_start,
+            upper_start,
+            &lower_pda,
+            &wrong_upper,
+        ));
+    }
 }
 

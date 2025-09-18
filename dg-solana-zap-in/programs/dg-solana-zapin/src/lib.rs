@@ -185,7 +185,7 @@ pub mod dg_solana_zapin {
             _ => return Err(error!(ErrorCode::InvalidParams)),
         };
         msg!("DEBUG: params = {:?}", params);
-        helpers::execute_open_position_with_loading(&ctx, transfer_id, &params)
+        helpers::execute_open_position(&ctx, transfer_id, &params)
     }
 
      /// Increase-liquidity step for ZapIn: supplies tokens to the position
@@ -258,6 +258,7 @@ pub struct Execute<'info> {
     )]
     pub operation_data: Account<'info, OperationData>,
     /// Caller authorized to execute
+    #[account(mut)]
     pub caller: Signer<'info>,
 
     // Program-owned token accounts
@@ -296,6 +297,7 @@ pub struct Execute<'info> {
     /// CHECK: forwarded to Raydium
     pub position_nft_mint: UncheckedAccount<'info>,
     /// CHECK: 
+    #[account(mut)]
     pub position_nft_account: UncheckedAccount<'info>,
 
     // Token vaults and mints
@@ -321,6 +323,7 @@ pub struct Execute<'info> {
     /// CHECK: metadata program
     pub metadata_program: UncheckedAccount<'info>,
     /// CHECK: metadata account
+    #[account(mut)]
     pub metadata_account: UncheckedAccount<'info>,
 }
 
