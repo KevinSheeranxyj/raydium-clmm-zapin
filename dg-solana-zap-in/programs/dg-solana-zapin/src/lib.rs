@@ -193,18 +193,18 @@ pub mod dg_solana_zapin {
     }
 
      /// Increase-liquidity step for ZapIn: supplies tokens to the position
-     pub fn increase_liquidity_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
-        let caller_key = ctx.accounts.caller.key();
-        helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
-        let action = ctx.accounts.operation_data.action.clone();
-        let params = match action {
-            ActionData::ZapIn(p) => p,
-            _ => return Err(error!(ErrorCode::InvalidParams)),
-        };
-        let is_base_input = ctx.accounts.operation_data.base_input_flag;
-        msg!("DEBUG: is_base_input = {}", is_base_input);
-        helpers::execute_increase_liquidity(&ctx, transfer_id, &params, is_base_input)
-    }
+    //  pub fn increase_liquidity_zap_in(ctx: Context<Execute>, transfer_id: [u8; 32]) -> Result<()> {
+    //     let caller_key = ctx.accounts.caller.key();
+    //     helpers::validate_operation_state(&ctx.accounts.operation_data, &caller_key)?;
+    //     let action = ctx.accounts.operation_data.action.clone();
+    //     let params = match action {
+    //         ActionData::ZapIn(p) => p,
+    //         _ => return Err(error!(ErrorCode::InvalidParams)),
+    //     };
+    //     let is_base_input = ctx.accounts.operation_data.base_input_flag;
+    //     msg!("DEBUG: is_base_input = {}", is_base_input);
+    //     helpers::execute_increase_liquidity(&ctx, transfer_id, &params, is_base_input)
+    // }
 
    
     /// Finalize step for ZapIn: marks the operation executed
@@ -300,7 +300,7 @@ pub struct Execute<'info> {
     // Position NFT
     /// CHECK: forwarded to Raydium
     #[account(mut)]
-    pub position_nft_mint: UncheckedAccount<'info>,
+    pub position_nft_mint: Signer<'info>,
     /// CHECK: 
     #[account(mut)]
     pub position_nft_account: UncheckedAccount<'info>,

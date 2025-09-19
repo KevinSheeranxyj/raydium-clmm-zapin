@@ -530,7 +530,7 @@ fn execute_swap_logic(
 
 /// Execute the actual swap CPI
 fn execute_actual_swap<'info>(
-    ctx: &Context<'_, '_, '_, 'info, Execute<'info>>,
+    ctx: &Context<Execute>,
     transfer_id: [u8; 32],
     base_input_flag: bool,
     swap_amount: u64,
@@ -567,7 +567,6 @@ fn execute_actual_swap<'info>(
         &[bump_seeds]
     ]];
     msg!("DEBUG: signer_seeds = {:?}", signer_seeds);
-    let remaining_accounts = ctx.remaining_accounts.to_vec();
     // Execute Raydium swap
     do_swap_single_v2(
         ctx.accounts.clmm_program.to_account_info(),
@@ -577,7 +576,8 @@ fn execute_actual_swap<'info>(
         ctx.accounts.amm_config.to_account_info(),
         ctx.accounts.pool_state.to_account_info(),
         ctx.accounts.observation_state.to_account_info(),
-        remaining_accounts,
+        ctx.accounts.tick_array_upper.to_account_info(),
+        ctx.accounts.tick_array_lower.to_account_info(),
         in_acc,
         out_acc,
         in_vault,
@@ -605,7 +605,8 @@ pub fn do_swap_single_v2<'a>(
     amm_config: AccountInfo<'a>,
     pool_state: AccountInfo<'a>,
     observation: AccountInfo<'a>,
-    tick_arrays: Vec<AccountInfo<'a>>, // from remaining_accounts: at least 2
+    tick_array_upper: AccountInfo<'a>,
+    tick_array_lower: AccountInfo<'a>,
     input_acc: AccountInfo<'a>,
     output_acc: AccountInfo<'a>,
     input_vault: AccountInfo<'a>,
@@ -633,6 +634,7 @@ pub fn do_swap_single_v2<'a>(
         input_vault_mint: input_mint,
         output_vault_mint: output_mint,
     };
+    let tick_arrays = vec![tick_array_upper, tick_array_lower];
     let ctx = CpiContext::new(clmm_prog_ai, accts)
         .with_signer(signer_seeds)
         .with_remaining_accounts(tick_arrays);
@@ -649,7 +651,7 @@ pub fn do_swap_single_v2<'a>(
 /// Execute open_position operation
 #[inline(never)]
 pub fn execute_open_position<'info>(
-    ctx: &Context<'_, '_, '_, 'info, Execute<'info>>,
+    ctx: &Context<Execute<'info>>,
     is_base_input: bool,
     p: &ZapInParams,
 ) -> Result<()> {
@@ -675,9 +677,9 @@ pub fn execute_open_position<'info>(
     msg!("DEBUG: owner_pda: {}", owner_pda);
     msg!("DEBUG: mint_key: {}", mint_key);
     let expected_ata = get_associated_token_address_with_program_id(
-        &owner_pda,
+        &owner_pda.key(),
         &mint_key,
-        &ctx.accounts.token_program_2022.key(), // 或 TOKEN_2022_ID
+        &ctx.accounts.token_program_2022.key(),
     );
     require_keys_eq!(ctx.accounts.position_nft_account.key(), expected_ata, ErrorCode::InvalidParams);
     
@@ -705,10 +707,6 @@ pub fn execute_open_position<'info>(
     }
     msg!("do_open_position_v2");
     msg!("DEBUG: About to call do_open_position_v2");
-    // Take tick arrays from remaining_accounts
-    let ta_lower_ai = ctx.remaining_accounts[0].clone();
-    let ta_upper_ai = ctx.remaining_accounts[1].clone();
-
     do_open_position_v2(
         ctx.accounts.clmm_program.to_account_info(),
         ctx.accounts.operation_data.to_account_info(), // payer = PDA
@@ -718,8 +716,8 @@ pub fn execute_open_position<'info>(
         ctx.accounts.position_nft_account.to_account_info(),
         ctx.accounts.personal_position.to_account_info(),
         ctx.accounts.protocol_position.to_account_info(),
-        ta_lower_ai,
-        ta_upper_ai,
+        ctx.accounts.tick_array_lower.to_account_info(),
+        ctx.accounts.tick_array_upper.to_account_info(),
         ctx.accounts.token_program.to_account_info(),
         ctx.accounts.system_program.to_account_info(),
         ctx.accounts.rent.to_account_info(),
@@ -754,8 +752,8 @@ pub fn do_open_position_v2<'a>(
     position_nft_account: AccountInfo<'a>,
     personal_position: AccountInfo<'a>,
     protocol_pos: AccountInfo<'a>,
-    ta_lower: AccountInfo<'a>,
-    ta_upper: AccountInfo<'a>,
+    tick_array_lower: AccountInfo<'a>,
+    tick_array_upper: AccountInfo<'a>,
     token_prog_ai: AccountInfo<'a>,
     system_prog_ai: AccountInfo<'a>,
     rent_sysvar_ai: AccountInfo<'a>,
@@ -784,8 +782,8 @@ pub fn do_open_position_v2<'a>(
         position_nft_account: position_nft_account,
         personal_position,
         protocol_position: protocol_pos,
-        tick_array_lower: ta_lower,
-        tick_array_upper: ta_upper,
+        tick_array_lower: tick_array_lower,
+        tick_array_upper: tick_array_upper,
         token_program: token_prog_ai,
         system_program: system_prog_ai,
         rent: rent_sysvar_ai,
