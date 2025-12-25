@@ -1,0 +1,23 @@
+{
+  "CLMM_PROGRAM_ID": "CAMMCzo5YL8w4VFF8KVHrK22GGUsp5VTaW7grrKgrWqK",
+  "POOL_STATE": "jARisjr1imNxjhgwM3VqCghJFMKoK8p35TVAByhiGUW",
+  "AMM_CONFIG": "2QdhepnKRTLjjSqj1oeoRjy7PJZ7RX9Q9FdcQzq6BEin",
+  "OBSERVATION_STATE": "4vJ9JU1bJJE96FWSJKvHsmmFADCg4gpZQffMztkOvEDB",
+  "TOKEN_VAULT_0": "FgZut2qVQEyPBibaTJbbX2PxaM6vT1Sqr1D6A2inD9sP",
+  "TOKEN_VAULT_1": "4k3Dyjzvzp8eMZWUXbBCjEvwSkkk59S5iCNLY3QrkX6R",
+  "TOKEN_MINT_0": "So11111111111111111111111111111111111111112",
+  "TOKEN_MINT_1": "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v",
+  "TICK_SPACING": 1,
+  "SQRT_PRICE_X64": "79228162514264337593543950336",
+  "exampleTicks": {
+    "tickLower": -120,
+    "tickUpper": 120
+  },
+  "description": "Raydium CLMM pool from devnet RPC query",
+  "network": "devnet",
+  "poolType": "CLMM",
+  "feeRate": 0.0001,
+  "protocolFeeRate": 0.0001,
+  "source": "RPC Query",
+  "lastUpdated": "2025-09-11T01:32:06.804Z"
+}
